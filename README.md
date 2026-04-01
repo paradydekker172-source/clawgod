@@ -20,6 +20,8 @@ irm clawgod.0chen.cc/install.ps1 | iex
 
 Green logo = patched. Orange logo = original.
 
+![ClawGod Patched](bypass.png)
+
 ## What it does
 
 ### Feature Unlocks

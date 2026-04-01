@@ -20,6 +20,8 @@ irm clawgod.0chen.cc/install.ps1 | iex
 
 緑のロゴ = パッチ適用済み。オレンジのロゴ = オリジナル。
 
+![ClawGod 適用結果](bypass.png)
+
 ## 機能一覧
 
 ### 機能アンロック

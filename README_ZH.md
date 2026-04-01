@@ -20,6 +20,8 @@ irm clawgod.0chen.cc/install.ps1 | iex
 
 绿色 Logo = 已 Patch。橙色 Logo = 原版。
 
+![ClawGod 效果展示](bypass.png)
+
 ## 功能一览
 
 ### 功能解锁
