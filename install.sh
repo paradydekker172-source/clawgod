@@ -57,7 +57,10 @@ if [ "$UNINSTALL" = "1" ]; then
     fi
   done
   rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/patch.js"
+  hash -r 2>/dev/null
   info "ClawGod uninstalled"
+  echo ""
+  warn "  Restart your terminal or run: hash -r"
   echo ""
   exit 0
 fi

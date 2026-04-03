@@ -77,12 +77,15 @@ irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 | ie
 **macOS / Linux:**
 ```bash
 curl -fsSL https://github.com/0Chencc/clawgod/releases/latest/download/install.sh | bash -s -- --uninstall
+hash -r  # シェルキャッシュをリフレッシュ
 ```
 
 **Windows:**
 ```powershell
 irm https://github.com/0Chencc/clawgod/releases/latest/download/install.ps1 -OutFile install.ps1; .\install.ps1 -Uninstall
 ```
+
+> インストール・アンインストール後、コマンドがすぐに反映されない場合はターミナルを再起動するか `hash -r` を実行してください。
 
 ## 要件
 

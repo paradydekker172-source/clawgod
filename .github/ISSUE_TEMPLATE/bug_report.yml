@@ -2,22 +2,11 @@ name: Bug Report
 description: Report a problem with ClawGod
 labels: ["bug"]
 body:
-  - type: markdown
-    attributes:
-      value: |
-        Thanks for reporting. Please fill in the details below so we can reproduce and fix the issue.
-
-  - type: dropdown
+  - type: input
     id: os
     attributes:
-      label: Operating System
-      options:
-        - macOS (Apple Silicon)
-        - macOS (Intel)
-        - Windows 10
-        - Windows 11
-        - Linux (Ubuntu/Debian)
-        - Linux (Other)
+      label: OS
+      placeholder: "e.g. macOS 15.3 / Ubuntu 24.04 / Windows 11"
     validations:
       required: true
 
@@ -25,34 +14,7 @@ body:
     id: claude-version
     attributes:
       label: Claude Code Version
-      description: "Run `claude --version` or check the version shown at startup"
-      placeholder: "e.g. 2.1.90"
-    validations:
-      required: true
-
-  - type: dropdown
-    id: install-method
-    attributes:
-      label: Claude Code Install Method
-      description: How was Claude Code installed before applying ClawGod?
-      options:
-        - Native (curl -fsSL https://claude.ai/install.sh | bash)
-        - npm (-g install @anthropic-ai/claude-code)
-        - pnpm
-        - yarn
-        - Not installed (ClawGod was my first install)
-    validations:
-      required: true
-
-  - type: dropdown
-    id: clawgod-version
-    attributes:
-      label: ClawGod Version
-      options:
-        - v1.0.2 (latest)
-        - v1.0.1
-        - v1.0.0
-        - Not sure
+      placeholder: "e.g. 2.1.90 (run: claude --version)"
     validations:
       required: true
 
@@ -60,47 +22,13 @@ body:
     id: description
     attributes:
       label: What happened?
-      placeholder: Describe the problem clearly.
+      description: Paste error messages if any.
+      render: shell
     validations:
       required: true
 
   - type: textarea
-    id: expected
+    id: screenshot
     attributes:
-      label: What did you expect?
-      placeholder: What should have happened instead?
-    validations:
-      required: true
-
-  - type: textarea
-    id: install-log
-    attributes:
-      label: Install Log
-      description: "Paste the full output of the install command"
-      render: shell
-      placeholder: |
-        $ curl -fsSL https://github.com/0Chencc/clawgod/releases/latest/download/install.sh | bash
-        (paste full output here)
-
-  - type: textarea
-    id: error-log
-    attributes:
-      label: Error Log
-      description: "Paste any error messages when running `claude`"
-      render: shell
-      placeholder: |
-        $ claude
-        (paste error output here)
-
-  - type: textarea
-    id: debug-info
-    attributes:
-      label: Debug Info
-      description: "Run the commands below and paste the output"
-      render: shell
-      placeholder: |
-        $ which claude
-        $ file $(which claude)
-        $ node --version
-        $ cat ~/.clawgod/package.json
-        $ node ~/.clawgod/patch.js --verify
+      label: Screenshot (optional)
+      description: Drag and drop if helpful.
