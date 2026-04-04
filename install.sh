@@ -50,7 +50,7 @@ if [ "$UNINSTALL" = "1" ]; then
       # Has backup — restore it
       mv "$DIR/claude.orig" "$DIR/claude"
       info "Original claude restored ($DIR/claude)"
-    elif [ -f "$DIR/claude" ] && head -1 "$DIR/claude" 2>/dev/null | grep -q "clawgod"; then
+    elif [ -f "$DIR/claude" ] && grep -q "clawgod" "$DIR/claude" 2>/dev/null; then
       # Our launcher, no backup — remove it (otherwise it points to deleted cli.js)
       rm -f "$DIR/claude"
       info "Removed ClawGod launcher ($DIR/claude)"
@@ -238,6 +238,16 @@ const patches = [
   {
     name: 'Ultrareview enable',
     pattern: /function (\w+)\(\)\{return \w+\("tengu_review_bughunter_config",null\)\?\.enabled===!0\}/g,
+    replacer: (m, fn) => `function ${fn}(){return!0}`,
+  },
+  {
+    name: 'Computer Use gate bypass',
+    pattern: /function (\w+)\(\)\{return \w+\(\)&&\w+\(\)\.enabled\}/g,
+    replacer: (m, fn) => `function ${fn}(){return!0}`,
+  },
+  {
+    name: 'Voice Mode enable (bypass GrowthBook kill)',
+    pattern: /function (\w+)\(\)\{return!\w+\("tengu_amber_quartz_disabled",!1\)\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   // ── 绿色主题 (patch 标识) ──
@@ -445,7 +455,9 @@ if [ ! -f "$CLAWGOD_DIR/features.json" ]; then
   "tengu_auto_background_agents": true,
   "tengu_destructive_command_warning": true,
   "tengu_immediate_model_command": true,
-  "tengu_desktop_upsell": false
+  "tengu_desktop_upsell": false,
+  "tengu_malort_pedway": {"enabled": true},
+  "tengu_amber_quartz_disabled": false
 }
 FEATURES_EOF
   info "Default features.json created"
