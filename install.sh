@@ -1454,6 +1454,15 @@ EXTRACTOR_EOF
   rm -f "$CLAWGOD_DIR/extract-natives.mjs"
 fi
 
+# ─── Install native mode dependencies ───────────────────
+# The extracted JS bundle requires ws and other modules
+
+if [ "$INSTALL_MODE" = "native" ]; then
+  dim "Installing dependencies for native mode ..."
+  npm install --prefix "$CLAWGOD_DIR" ws --save --no-fund --no-audit 2>/dev/null
+  info "Dependencies installed"
+fi
+
 # ─── Write CJS wrapper (cli.js) ─────────────────────────
 
 cat > "$CLAWGOD_DIR/cli.js" << 'WRAPPER_EOF'
