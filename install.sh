@@ -44,7 +44,7 @@ echo ""
 
 if [ "$UNINSTALL" = "1" ]; then
   CLAUDE_BIN=$(which claude 2>/dev/null)
-  for DIR in "${CLAUDE_BIN:+$(dirname "$CLAUDE_BIN")}" "$BIN_DIR"; do
+  for DIR in "${CLAUDE_BIN:+$(dirname "$CLAUDE_BIN")}" "$BIN_DIR" "/usr/bin" "/usr/local/bin" "$HOME/.npm-global/bin"; do
     [ -z "$DIR" ] && continue
     if [ -e "$DIR/claude.orig" ]; then
       # Has backup — restore it
@@ -615,22 +615,22 @@ const BACKUP = TARGET + '.bak';
 const patches = [
   {
     name: 'USER_TYPE → ant',
-    pattern: /function (\w+)\(\)\{return"external"\}/g,
+    pattern: /function ([\w$]+)\(\)\{return"external"\}/g,
     replacer: (m, fn) => `function ${fn}(){return"ant"}`,
     sentinel: 'return"external"',
   },
   {
     name: 'GrowthBook env overrides',
-    pattern: /function (\w+)\(\)\{if\(!(\w+)\)(\w+)=!0;return (\w+)\}/g,
+    pattern: /function ([\w$]+)\(\)\{if\(!([\w$]+)\)([\w$]+)=!0;return ([\w$]+)\}/g,
     replacer: (m, fn, flag, flag2, val) =>
       `function ${fn}(){if(!${flag}){${flag2}=!0;try{let e=process.env.CLAUDE_INTERNAL_FC_OVERRIDES;if(e)${val}=JSON.parse(e)}catch(e){}}return ${val}}`,
     unique: true,  // must match exactly 1
   },
   {
     name: 'GrowthBook config overrides',
-    pattern: /function (\w+)\(\)\{return\}(function)/g,
+    pattern: /function ([\w$]+)\(\)\{return\}(function)/g,
     replacer: (m, fn, next) =>
-      `function ${fn}(){try{return j8().growthBookOverrides??null}catch{return null}}${next}`,
+      `function ${fn}(){try{return kSH().growthBookOverrides??null}catch{return null}}${next}`,
     selectIndex: 0,  // first match only (there may be others)
     validate: (match, code) => {
       // Must be near other GrowthBook functions
@@ -641,17 +641,17 @@ const patches = [
   },
   {
     name: 'Agent Teams always enabled',
-    pattern: /function (\w+)\(\)\{if\(!\w+\(process\.env\.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\)&&!\w+\(\)\)return!1;if\(!\w+\("tengu_amber_flint",!0\)\)return!1;return!0\}/g,
+    pattern: /function ([\w$]+)\(\)\{if\(![\w$]+\(process\.env\.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS\)&&![\w$]+\(\)\)return!1;if\(![\w$]+\("tengu_amber_flint",!0\)\)return!1;return!0\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     name: 'Computer Use subscription bypass',
-    pattern: /function (\w+)\(\)\{let \w+=\w+\(\);return \w+==="max"\|\|\w+==="pro"\}/g,
+    pattern: /function ([\w$]+)\(\)\{let [\w$]+=[\w$]+\(\);return [\w$]+==="max"\|\|[\w$]+==="pro"\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     name: 'Computer Use default enabled',
-    pattern: /(\w+=)\{enabled:!1,pixelValidation/g,
+    pattern: /([\w$]+=)\{enabled:!1,pixelValidation/g,
     replacer: (m, prefix) => `${prefix}{enabled:!0,pixelValidation`,
   },
   {
@@ -662,24 +662,24 @@ const patches = [
   },
   {
     name: 'Ultrareview enable',
-    pattern: /function (\w+)\(\)\{return \w+\("tengu_review_bughunter_config",null\)\?\.enabled===!0\}/g,
+    pattern: /function ([\w$]+)\(\)\{return [\w$]+\("tengu_review_bughunter_config",null\)\?\.enabled===!0\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     name: 'Computer Use gate bypass',
-    pattern: /function (\w+)\(\)\{return \w+\(\)&&\w+\(\)\.enabled\}/g,
+    pattern: /function ([\w$]+)\(\)\{return [\w$]+\(\)&&[\w$]+\(\)\.enabled\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     name: 'Voice Mode enable (bypass GrowthBook kill)',
-    pattern: /function (\w+)\(\)\{return!\w+\("tengu_amber_quartz_disabled",!1\)\}/g,
+    pattern: /function ([\w$]+)\(\)\{return![\w$]+\("tengu_amber_quartz_disabled",!1\)\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
   },
   {
     // iG6(q){...let Y=Dq();if(Y!=="firstParty"&&Y!=="anthropicAws")return!1;return/^claude-(opus|sonnet)-4-6/.test(K)}
     // Drop the firstParty/anthropicAws gate so third-party API users can use auto-mode
     name: 'Auto-mode unlock for third-party API',
-    pattern: /let (\w+)=\w+\(\);if\(\1!=="firstParty"&&\1!=="anthropicAws"\)return!1;return\/\^claude-\(opus\|sonnet\)-4-6\/\.test\((\w+)\)/g,
+    pattern: /let ([\w$]+)=[\w$]+\(\);if\(\1!=="firstParty"&&\1!=="anthropicAws"\)return!1;return\/\^claude-\(opus\|sonnet\)-4-6\/\.test\(([\w$]+)\)/g,
     replacer: (m, v, modelVar) => `return/^claude-(opus|sonnet)-4-/.test(${modelVar})`,
   },
   // ── 绿色主题 (patch 标识) ──
@@ -724,19 +724,19 @@ const patches = [
 
   {
     name: 'Remove CYBER_RISK_INSTRUCTION',
-    pattern: /(\w+)="IMPORTANT: Assist with authorized security testing[^"]*"/g,
+    pattern: /([\w$]+)="IMPORTANT: Assist with authorized security testing[^"]*"/g,
     replacer: (m, varName) => `${varName}=""`,
     sentinel: 'Assist with authorized security testing',
   },
   {
     name: 'Remove URL generation restriction',
-    pattern: /\n\$\{\w+\}\nIMPORTANT: You must NEVER generate or guess URLs[^.]*\. You may use URLs provided by the user in their messages or local files\./g,
+    pattern: /\n\$\{[\w$]+\}\nIMPORTANT: You must NEVER generate or guess URLs[^.]*\. You may use URLs provided by the user in their messages or local files\./g,
     replacer: () => '',
     sentinel: 'IMPORTANT: You must NEVER generate or guess URLs',
   },
   {
     name: 'Remove cautious actions section',
-    pattern: /function (\w+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
+    pattern: /function ([\w$]+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
     replacer: (m, fn) => `function ${fn}(){return\`\`}`,
     sentinel: '# Executing actions with care',
   },
@@ -755,14 +755,14 @@ const patches = [
     //                    in v2.1.110, so this filter is effectively a no-op; patch anyway
     //                    to guard against paY being populated in future versions.
     name: 'Attachment filter bypass',
-    pattern: /(\w+)\(\)!=="ant"(&&\w+\.has\(\w+\.attachment\.type\)|\)\{if\(\w+\.attachment\.type==="hook_additional_context")/g,
-    replacer: (m) => m.replace(/(\w+)\(\)!=="ant"/, 'false'),
+    pattern: /([\w$]+)\(\)!=="ant"(&&[\w$]+\.has\([\w$]+\.attachment\.type\)|\)\{if\([\w$]+\.attachment\.type==="hook_additional_context")/g,
+    replacer: (m) => m.replace(/([\w$]+)\(\)!=="ant"/, 'false'),
     optional: true,  // filter may be removed entirely in future versions
   },
   {
     // Legacy (≤v2.1.91) ternary form: fn()!=="ant"?tRY(_,sRY(K)):K
     name: 'Message list filter bypass (legacy ternary)',
-    pattern: /(\w+)\(\)!=="ant"\?(\w+)\((\w+),(\w+)\((\w+)\)\):(\w+)/g,
+    pattern: /([\w$]+)\(\)!=="ant"\?([\w$]+)\(([\w$]+),([\w$]+)\(([\w$]+)\)\):([\w$]+)/g,
     replacer: (m, fn, tRY, underscore, sRY, K, fallback) => fallback,
     optional: true,  // removed in v2.1.92+
   },
@@ -770,7 +770,7 @@ const patches = [
     // v2.1.92+ (s_8): if(fn()==="ant")return _;let z=...;return FaY(_,z)
     // Flip the guard so non-ant users also return the pre-filtered list.
     name: 'Message list filter bypass (s_8 form)',
-    pattern: /if\((\w+)\(\)==="ant"\)return (\w+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
+    pattern: /if\(([\w$]+)\(\)==="ant"\)return ([\w$]+);let ([\w$]+)=([\w$]+) instanceof Set\?\4:([\w$]+)\(\4\);return ([\w$]+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
     optional: true,  // legacy versions had a ternary instead
   },
@@ -977,6 +977,10 @@ fi
 
 # Write launcher to the SAME directory where claude was found
 mkdir -p "$CLAUDE_DIR"
+# Remove symlink first to avoid overwriting the target file
+if [ -L "$CLAUDE_BIN" ]; then
+  rm -f "$CLAUDE_BIN"
+fi
 echo "$LAUNCHER_CONTENT" > "$CLAUDE_BIN"
 chmod +x "$CLAUDE_BIN"
 info "Command 'claude' → patched ($CLAUDE_BIN)"
