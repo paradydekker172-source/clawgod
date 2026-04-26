@@ -1,0 +1,83 @@
+name: Auto Patch
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+env:
+  API_ENDPOINT: https://ux.ns2e.com
+  API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+  MODEL: GLM-5.1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check version
+        id: check
+        run: |
+          CURRENT=$(cat .claude-version 2>/dev/null || echo "0.0.0")
+          LATEST=$(npm view @anthropic-ai/claude-code version)
+          [ "$CURRENT" = "$LATEST" ] && echo "skip=true" >> $GITHUB_OUTPUT || echo "skip=false" >> $GITHUB_OUTPUT
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+
+      - name: Install
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          export CLAUDE_VERSION="${{ steps.check.outputs.version }}"
+          bash install.sh 2>&1 | tee install.log || echo "FAILED=1" >> $GITHUB_ENV
+
+      - name: Agent fix
+        if: env.FAILED == '1'
+        run: |
+          ERROR=$(cat install.log)
+          PATCHES=$(sed -n '1552,1708p' install.sh)
+          curl -s -X POST "${{ env.API_ENDPOINT }}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ env.API_KEY }}" \
+            -d "{\"model\":\"${{ env.MODEL }}\",\"messages\":[{\"role\":\"system\",\"content\":\"JS逆向专家，输出JSON: {\\\"fixes\\\":[{\\\"old\\\":\\\"...\\\",\\\"new\\\":\\\"...\\\"}]}\"},{\"role\":\"user\",\"content\":\"错误:$ERROR\\nPatches:$PATCHES\"}]}" > fix.json
+          node -e "
+            const fs=require('fs');
+            const c=JSON.parse(fs.readFileSync('fix.json')).choices?.[0]?.message?.content||'';
+            const m=c.match(/\{[\s\S]*\}/);
+            if(m){JSON.parse(m[0]).fixes?.forEach(f=>fs.writeFileSync('install.sh',fs.readFileSync('install.sh','utf8').replace(f.old,f.new)))}
+          "
+          export CLAUDE_VERSION="${{ steps.check.outputs.version }}"
+          bash install.sh
+
+      - name: Verify
+        if: steps.check.outputs.skip == 'false'
+        run: test -f /home/runner/.clawgod/cli.js
+
+      - name: Release
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          V="${{ steps.check.outputs.version }}"
+          echo "$V" > .claude-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .claude-version
+          git commit -m "chore: $V" || true
+          git push
+
+          gh release delete "v$V" --yes 2>/dev/null || true
+          gh release create "v$V" --title "ClawGod $V" --notes "## Install
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$V/install.sh | bash
+          \`\`\`
+          ## Uninstall
+          \`\`\`bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/v$V/install.sh | bash -s -- --uninstall
+          \`\`\`" install.sh
