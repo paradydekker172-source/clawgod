@@ -794,7 +794,7 @@ const patches = [
   {
     // v2.1.119+: Use [\w$] for variable names containing $, triple backslash for quotes
     name: 'Message list filter bypass (s_8 form)',
-    pattern: /if\((\w+)\(\)===\"ant\"\)return ([\w\$]+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
+    pattern: /if\((\w+)\(\)===\"ant\"\)return ([\w\$]+);let (\w+)=([\w\$]+) instanceof Set\?\4:([\w\$]+)\(\4\);return (\w+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
     optional: true,  // legacy versions had a ternary instead
   },
@@ -1689,7 +1689,7 @@ const patches = [
   {
     // v2.1.119+: Use [\w$] for variable names containing $, triple backslash for quotes
     name: 'Message list filter bypass (s_8 form)',
-    pattern: /if\((\w+)\(\)===\"ant\"\)return ([\w\$]+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
+    pattern: /if\((\w+)\(\)===\"ant\"\)return ([\w\$]+);let (\w+)=([\w\$]+) instanceof Set\?\4:([\w\$]+)\(\4\);return (\w+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
     optional: true,
   },
