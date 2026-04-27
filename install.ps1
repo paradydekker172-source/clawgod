@@ -837,7 +837,7 @@ const patches = [
   },
   {
     name: 'Attachment filter bypass',
-    pattern: /(\w+)\(\)!=="ant"(&&\w+\.has\(\w+\.attachment\.type\)|\)\{if\(\w+\.attachment\.type==="hook_additional_context")/g,
+    pattern: /(\w+)\(\)!=="ant"&&[\w\$]+\.has\(\w+\.attachment\.type\)/g,
     replacer: (m) => m.replace(/(\w+)\(\)!=="ant"/, 'false'),
     optional: true,
   },
@@ -1586,7 +1586,7 @@ const patches = [
   },
   {
     name: 'Attachment filter bypass',
-    pattern: /(\w+)\(\)!=="ant"(&&\w+\.has\(\w+\.attachment\.type\)|\)\{if\(\w+\.attachment\.type==="hook_additional_context")/g,
+    pattern: /(\w+)\(\)!=="ant"&&[\w\$]+\.has\(\w+\.attachment\.type\)/g,
     replacer: (m) => m.replace(/(\w+)\(\)!=="ant"/, 'false'),
     optional: true,
   },

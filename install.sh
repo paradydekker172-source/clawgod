@@ -787,7 +787,7 @@ const patches = [
     //                    in v2.1.110, so this filter is effectively a no-op; patch anyway
     //                    to guard against paY being populated in future versions.
     name: 'Attachment filter bypass',
-    pattern: /(\w+)\(\)!=="ant"(&&\w+\.has\(\w+\.attachment\.type\)|\)\{if\(\w+\.attachment\.type==="hook_additional_context")/g,
+    pattern: /(\w+)\(\)!=="ant"&&[\w\$]+\.has\(\w+\.attachment\.type\)/g,
     replacer: (m) => m.replace(/(\w+)\(\)!=="ant"/, 'false'),
     optional: true,  // filter may be removed entirely in future versions
   },
@@ -1586,7 +1586,7 @@ const patches = [
   },
   {
     name: 'Ultraplan enable',
-    pattern: /(name:"ultraplan",description:`[^`]+`,argumentHint:"<prompt>",isEnabled:\(\)=>)!1/g,
+    pattern: /(argumentHint:"<prompt>",isEnabled:\(\)=>)da\(\)/g,
     replacer: (m, prefix) => `${prefix}!0`,
     optional: true,
   },
@@ -1682,7 +1682,7 @@ const patches = [
 
   {
     name: 'Attachment filter bypass',
-    pattern: /(\w+)\(\)!=="ant"(&&\w+\.has\(\w+\.attachment\.type\)|\)\{if\(\w+\.attachment\.type==="hook_additional_context")/g,
+    pattern: /(\w+)\(\)!=="ant"&&[\w\$]+\.has\(\w+\.attachment\.type\)/g,
     replacer: (m) => m.replace(/(\w+)\(\)!=="ant"/, 'false'),
     optional: true,
   },
