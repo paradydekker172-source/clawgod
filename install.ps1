@@ -1696,6 +1696,8 @@ if (-not (Test-Path $featuresFile)) {
   "tengu_destructive_command_warning": true,
   "tengu_immediate_model_command": true,
   "tengu_desktop_upsell": false,
+  "tengu_malort_pedway": {"enabled": true},
+  "tengu_amber_quartz_disabled": false,
   "tengu_prompt_cache_1h_config": {"allowlist": ["*"]}
 }
 '@ | Set-Content $featuresFile -Encoding UTF8

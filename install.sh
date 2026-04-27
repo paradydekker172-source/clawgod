@@ -1452,7 +1452,7 @@ fi
 
 if [ "$INSTALL_MODE" = "native" ]; then
   dim "Installing dependencies for native mode ..."
-  npm install --prefix "$CLAWGOD_DIR" ws --save --no-fund --no-audit 2>/dev/null
+  npm install --prefix "$CLAWGOD_DIR" ws undici yaml ajv-formats ajv node-fetch --save --no-fund --no-audit 2>/dev/null
   info "Dependencies installed"
 fi
 
