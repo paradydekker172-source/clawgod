@@ -683,8 +683,9 @@ const patches = [
     replacer: (m, prefix) => `${prefix}{enabled:!0,pixelValidation`,
   },
   {
+    // v2.1.119+: isEnabled:()=>da() where da() checks GrowthBook flags
     name: 'Ultraplan enable',
-    pattern: /(name:"ultraplan",description:`[^`]+`,argumentHint:"<prompt>",isEnabled:\(\)=>)!1/g,
+    pattern: /(argumentHint:"<prompt>",isEnabled:\(\)=>)da\(\)/g,
     replacer: (m, prefix) => `${prefix}!0`,
     optional: true,  // v2.1.89+ merged into /plan, no standalone command
   },
@@ -791,17 +792,9 @@ const patches = [
     optional: true,  // filter may be removed entirely in future versions
   },
   {
-    // Legacy (≤v2.1.91) ternary form: fn()!=="ant"?tRY(_,sRY(K)):K
-    name: 'Message list filter bypass (legacy ternary)',
-    pattern: /(\w+)\(\)!=="ant"\?(\w+)\((\w+),(\w+)\((\w+)\)\):(\w+)/g,
-    replacer: (m, fn, tRY, underscore, sRY, K, fallback) => fallback,
-    optional: true,  // removed in v2.1.92+
-  },
-  {
-    // v2.1.92+ (s_8): if(fn()==="ant")return _;let z=...;return FaY(_,z)
-    // Flip the guard so non-ant users also return the pre-filtered list.
+    // v2.1.119+: Use [\w$] for variable names containing $, triple backslash for quotes
     name: 'Message list filter bypass (s_8 form)',
-    pattern: /if\((\w+)\(\)==="ant"\)return (\w+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
+    pattern: /if\((\w+)\(\)===\"ant\"\)return ([\w\$]+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
     optional: true,  // legacy versions had a ternary instead
   },
