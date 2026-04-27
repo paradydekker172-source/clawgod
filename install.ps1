@@ -29,6 +29,14 @@ function Write-OK($msg)   { Write-Host "  ✓ $msg" -ForegroundColor Green }
 function Write-Err($msg)  { Write-Host "  ✗ $msg" -ForegroundColor Red }
 function Write-Dim($msg)  { Write-Host "  $msg" -ForegroundColor DarkGray }
 
+# ─── Write file without BOM ───────────────────────────
+# PowerShell's Set-Content -Encoding UTF8 adds BOM which breaks Node.js
+
+function Write-File-NoBOM($path, $content) {
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($path, $content, $utf8NoBom)
+}
+
 Write-Host ""
 Write-Host "  ClawGod Installer" -ForegroundColor White -NoNewline
 Write-Host " (Windows)" -ForegroundColor DarkGray
@@ -95,6 +103,39 @@ if ($nodeVer -lt 18) {
 try { $null = Get-Command npm -ErrorAction Stop }
 catch {
     Write-Err "npm is required"
+    exit 1
+}
+
+# ─── Detect Git Bash (required for Claude Code on Windows) ─
+
+$gitBashPaths = @(
+    "C:\Program Files\Git\bin\bash.exe",
+    "C:\Program Files (x86)\Git\bin\bash.exe",
+    (Join-Path $env:ProgramFiles "Git\bin\bash.exe"),
+    (Join-Path ${env:ProgramFiles(x86)} "Git\bin\bash.exe")
+)
+
+$gitBashPath = $null
+foreach ($p in $gitBashPaths) {
+    if (Test-Path $p) {
+        $gitBashPath = $p
+        break
+    }
+}
+
+if (-not $gitBashPath) {
+    # Try to find via PATH
+    try {
+        $gitBashPath = (Get-Command bash -ErrorAction SilentlyContinue).Source
+    } catch {}
+}
+
+if ($gitBashPath) {
+    $env:CLAUDE_CODE_GIT_BASH_PATH = $gitBashPath
+    Write-Dim "Git Bash found: $gitBashPath"
+} else {
+    Write-Err "Git Bash not found. Claude Code requires Git Bash on Windows."
+    Write-Err "Install Git for Windows from https://git-scm.com/download/win"
     exit 1
 }
 
@@ -570,7 +611,7 @@ function main() {
 }
 
 main();
-'@ | Set-Content $extractorPath -Encoding UTF8
+'@ | Write-File-NoBOM $extractorPath
 
     & node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
     Remove-Item -Force $extractorPath -ErrorAction SilentlyContinue
@@ -582,11 +623,16 @@ main();
 
 # ─── Write wrapper (cli.js) ───────────────────────────
 
-@'
+$gitBashPathEscaped = $gitBashPath.Replace('\', '\\')
+
+$wrapperContent = @'
 #!/usr/bin/env node
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+
+// Git Bash path (required for Claude Code on Windows)
+process.env.CLAUDE_CODE_GIT_BASH_PATH ??= '__GIT_BASH_PATH__';
 
 const claudeDir = join(homedir(), '.claude');
 const clawgodDir = join(homedir(), '.clawgod');
@@ -642,7 +688,9 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
 }
 
 await import('./cli.original.js');
-'@ | Set-Content (Join-Path $ClawDir "cli.js") -Encoding UTF8
+'@
+$wrapperContent = $wrapperContent -replace '__GIT_BASH_PATH__', $gitBashPathEscaped
+Write-File-NoBOM (Join-Path $ClawDir "cli.js") $wrapperContent
 Write-OK "Wrapper created (cli.js)"
 
 # ─── Write universal patcher ──────────────────────────
@@ -880,7 +928,7 @@ if (!dryRun && !verify && applied > 0) {
 console.log(`${'='.repeat(55)}\n`);
 '@
 
-Set-Content (Join-Path $ClawDir "patch.js") $patcherCode -Encoding UTF8
+Write-File-NoBOM (Join-Path $ClawDir "patch.js") $patcherCode
 Write-OK "Patcher created (patch.js)"
 
 }  # end legacy mode
@@ -1044,11 +1092,18 @@ if (code.endsWith(cjsSuffix)) {
 
 writeFileSync(outputPath, code, 'utf8');
 console.log(`Bundle extracted: ${(code.length / 1024 / 1024).toFixed(1)} MB → ${outputPath}`);
-'@ | Set-Content $bundleExtractorPath -Encoding UTF8
+'@ | Write-File-NoBOM $bundleExtractorPath
 
-& node $bundleExtractorPath $NativeBin (Join-Path $ClawDir "cli.original.js") 2>&1 | ForEach-Object { Write-Host "  $_" }
-Remove-Item -Force $bundleExtractorPath -ErrorAction SilentlyContinue
-Write-OK "Bundle extracted (cli.original.js)"
+    & node $bundleExtractorPath $NativeBin (Join-Path $ClawDir "cli.original.js") 2>&1 | ForEach-Object { Write-Host "  $_" }
+    Remove-Item -Force $bundleExtractorPath -ErrorAction SilentlyContinue
+    Write-OK "Bundle extracted (cli.original.js)"
+
+    # ─── Install npm dependencies for extracted bundle ─────
+
+    Write-Dim "Installing npm dependencies for extracted bundle ..."
+    $npmDeps = "ws", "undici", "yaml", "ajv-formats", "ajv", "node-fetch"
+    npm install --prefix $ClawDir $npmDeps --save --no-fund --no-audit 2>$null | Out-Null
+    Write-OK "npm dependencies installed"
 
 # ─── Setup vendor directory ───────────────────────────
 
@@ -1314,7 +1369,7 @@ function main() {
 }
 
 main();
-'@ | Set-Content $extractorPath -Encoding UTF8
+'@ | Write-File-NoBOM $extractorPath
 
     & node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
     Remove-Item -Force $extractorPath -ErrorAction SilentlyContinue
@@ -1322,11 +1377,16 @@ main();
 
 # ─── Write CJS wrapper (cli.js) ─────────────────────────
 
-@'
+$gitBashPathEscaped = $gitBashPath.Replace('\', '\\')
+
+$wrapperContent = @'
 #!/usr/bin/env node
 const { readFileSync, existsSync, mkdirSync, writeFileSync } = require('fs');
 const { join } = require('path');
 const { homedir } = require('os');
+
+// Git Bash path (required for Claude Code on Windows)
+process.env.CLAUDE_CODE_GIT_BASH_PATH ??= '__GIT_BASH_PATH__';
 
 const claudeDir = join(homedir(), '.claude');
 const clawgodDir = join(homedir(), '.clawgod');
@@ -1387,7 +1447,9 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
 }
 
 require('./cli.original.js');
-'@ | Set-Content (Join-Path $ClawDir "cli.js") -Encoding UTF8
+'@
+$wrapperContent = $wrapperContent -replace '__GIT_BASH_PATH__', $gitBashPathEscaped
+Write-File-NoBOM (Join-Path $ClawDir "cli.js") $wrapperContent
 Write-OK "CJS wrapper created (cli.js)"
 
 # ─── Write universal patcher (CJS) ─────────────────────
@@ -1619,7 +1681,7 @@ if (!dryRun && !verify && applied > 0) {
 console.log(`${'='.repeat(55)}\n`);
 '@
 
-Set-Content (Join-Path $ClawDir "patch.js") $patcherCode -Encoding UTF8
+Write-File-NoBOM (Join-Path $ClawDir "patch.js") $patcherCode
 Write-OK "Patcher created (patch.js)"
 
 }  # end native mode
