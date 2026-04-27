@@ -1687,14 +1687,9 @@ const patches = [
     optional: true,
   },
   {
-    name: 'Message list filter bypass (legacy ternary)',
-    pattern: /(\w+)\(\)!=="ant"\?(\w+)\((\w+),(\w+)\((\w+)\)\):(\w+)/g,
-    replacer: (m, fn, tRY, underscore, sRY, K, fallback) => fallback,
-    optional: true,
-  },
-  {
+    // v2.1.119+: Use [\w$] for variable names containing $, triple backslash for quotes
     name: 'Message list filter bypass (s_8 form)',
-    pattern: /if\((\w+)\(\)==="ant"\)return (\w+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
+    pattern: /if\((\w+)\(\)===\"ant\"\)return ([\w\$]+);let (\w+)=(\w+) instanceof Set\?\4:(\w+)\(\4\);return (\w+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
     optional: true,
   },
