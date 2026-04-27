@@ -41,7 +41,7 @@ jobs:
         if: env.FAILED == '1'
         run: |
           ERROR=$(cat install.log)
-          PATCHES=$(sed -n '1552,1708p' install.sh)
+          PATCHES=$(sed -n '1543,1700p' install.sh)
           curl -s -X POST "${{ env.API_ENDPOINT }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer ${{ env.API_KEY }}" \
