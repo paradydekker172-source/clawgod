@@ -88,23 +88,14 @@ if ($Uninstall) {
 
 # ─── Prerequisites ────────────────────────────────────
 
-try { $null = Get-Command node -ErrorAction Stop }
-catch {
-    Write-Err "Node.js is required (>= 18). Install from https://nodejs.org"
+# Bun is required - no Node fallback
+if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+    Write-Err "Bun is required. Install from https://bun.sh"
+    Write-Err "  powershell -c `"`irm bun.sh/install.ps1 | iex`"`"
     exit 1
 }
 
-$nodeVer = [int](node -e "console.log(process.versions.node.split('.')[0])")
-if ($nodeVer -lt 18) {
-    Write-Err "Node.js >= 18 required (found v$nodeVer)"
-    exit 1
-}
-
-try { $null = Get-Command npm -ErrorAction Stop }
-catch {
-    Write-Err "npm is required"
-    exit 1
-}
+Write-OK "Using Bun runtime"
 
 # ─── Detect Git Bash (required for Claude Code on Windows) ─
 
@@ -1094,12 +1085,9 @@ console.log(`Bundle extracted: ${(code.length / 1024 / 1024).toFixed(1)} MB → 
     Remove-Item -Force $bundleExtractorPath -ErrorAction SilentlyContinue
     Write-OK "Bundle extracted (cli.original.js)"
 
-    # ─── Install npm dependencies for extracted bundle ─────
+    # ─── Bun has built-in deps - no npm install needed ─────
 
-    Write-Dim "Installing npm dependencies for extracted bundle ..."
-    $npmDeps = "ws", "undici", "yaml", "ajv-formats", "ajv", "node-fetch"
-    npm install --prefix $ClawDir $npmDeps --save --no-fund --no-audit 2>$null | Out-Null
-    Write-OK "npm dependencies installed"
+    Write-OK "Bun runtime — no external deps needed (built-in: ws, undici, yaml)"
 
 # ─── Setup vendor directory ───────────────────────────
 
@@ -1371,15 +1359,15 @@ main();
     Remove-Item -Force $extractorPath -ErrorAction SilentlyContinue
 }
 
-# ─── Write CJS wrapper (cli.js) ─────────────────────────
+# ─── Write Bun-compatible wrapper (cli.js) ─────────────────────────
 
 $gitBashPathEscaped = $gitBashPath.Replace('\', '\\')
 
 $wrapperContent = @'
-#!/usr/bin/env node
-const { readFileSync, existsSync, mkdirSync, writeFileSync } = require('fs');
-const { join } = require('path');
-const { homedir } = require('os');
+#!/usr/bin/env bun
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 
 // Git Bash path (required for Claude Code on Windows)
 process.env.CLAUDE_CODE_GIT_BASH_PATH ??= '__GIT_BASH_PATH__';
@@ -1442,11 +1430,11 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
-require('./cli.original.js');
+await import('./cli.original.js');
 '@
 $wrapperContent = $wrapperContent -replace '__GIT_BASH_PATH__', $gitBashPathEscaped
 Write-File-NoBOM (Join-Path $ClawDir "cli.js") $wrapperContent
-Write-OK "CJS wrapper created (cli.js)"
+Write-OK "Bun wrapper created (cli.js)"
 
 # ─── Write universal patcher (CJS) ─────────────────────
 
@@ -1707,7 +1695,7 @@ if (-not (Test-Path $featuresFile)) {
 # ─── Replace claude command ───────────────────────────
 
 $cliPath = (Join-Path $ClawDir "cli.js") -replace '\\', '\\'
-$launcherContent = "@echo off`r`nnode `"$cliPath`" %*"
+$launcherContent = "@echo off`r`nbun `"$cliPath`" %*"
 
 # Find and back up original claude
 $claudeCmd = Join-Path $BinDir "claude.cmd"

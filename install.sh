@@ -67,21 +67,14 @@ fi
 
 # ─── Prerequisites ─────────────────────────────────────
 
-if ! command -v node &>/dev/null; then
-  warn "Node.js is required (>= 18). Install from https://nodejs.org"
+# Bun is required - no Node fallback
+if ! command -v bun &>/dev/null; then
+  warn "Bun is required. Install from https://bun.sh"
+  warn "  curl -fsSL https://bun.sh/install | bash"
   exit 1
 fi
 
-NODE_VERSION=$(node -e "console.log(process.versions.node.split('.')[0])")
-if [ "$NODE_VERSION" -lt 18 ]; then
-  warn "Node.js >= 18 required (found v$NODE_VERSION)"
-  exit 1
-fi
-
-if ! command -v npm &>/dev/null; then
-  warn "npm is required"
-  exit 1
-fi
+info "Using Bun runtime"
 
 # ─── Install Claude Code from npm ──────────────────────
 
@@ -768,8 +761,8 @@ const patches = [
   },
   {
     name: 'Remove cautious actions section',
-    pattern: /function (\w+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
-    replacer: (m, fn) => `function ${fn}(){return\`\`}`,
+    pattern: /function (\w+)\((\w+)\)\{if\(\w+\(\w+\)==="compact"\)return`# Executing actions with care[\s\S]*?`\}function/g,
+    replacer: (m, fn, arg) => `function ${fn}(${arg}){return\`\`}\nfunction`,
     sentinel: '# Executing actions with care',
   },
   {
@@ -1052,23 +1045,9 @@ if (!text.startsWith('// @bun @bytecode')) {
   process.exit(1);
 }
 
-// Strip the Bun CJS wrapper so Node's require() can load it directly.
-// Bun format: (function(exports, require, module, __filename, __dirname) { ... })
-// Node's require() wraps files in its own IIFE, so the inner one must be removed.
+// Keep the full Bun bundle as-is (including @bun header and CJS wrapper)
+// Bun can load this directly
 let code = text.trimEnd();
-const cjsPrefix = '(function(exports, require, module, __filename, __dirname) {';
-const cjsSuffix = '})';
-if (code.startsWith('// @bun @bytecode')) {
-  const nlIdx = code.indexOf('\n');
-  if (nlIdx > 0) code = code.substring(nlIdx + 1); // strip @bun header line
-}
-if (code.startsWith(cjsPrefix)) {
-  code = code.substring(cjsPrefix.length);
-}
-code = code.trimEnd();
-if (code.endsWith(cjsSuffix)) {
-  code = code.substring(0, code.length - cjsSuffix.length);
-}
 
 writeFileSync(outputPath, code, 'utf8');
 console.log(`Bundle extracted: ${(code.length / 1024 / 1024).toFixed(1)} MB → ${outputPath}`);
@@ -1448,21 +1427,20 @@ EXTRACTOR_EOF
 fi
 
 # ─── Install native mode dependencies ───────────────────
-# The extracted JS bundle requires ws and other modules
+# Bun has built-in: ws, undici, yaml, ajv - no external deps needed
 
 if [ "$INSTALL_MODE" = "native" ]; then
-  dim "Installing dependencies for native mode ..."
-  npm install --prefix "$CLAWGOD_DIR" ws undici yaml ajv-formats ajv node-fetch --save --no-fund --no-audit 2>/dev/null
-  info "Dependencies installed"
+  info "Bun runtime — no external deps needed (built-in: ws, undici, yaml)"
 fi
 
-# ─── Write CJS wrapper (cli.js) ─────────────────────────
+# ─── Write Bun-compatible wrapper (cli.js) ─────────────────────────
 
 cat > "$CLAWGOD_DIR/cli.js" << 'WRAPPER_EOF'
-#!/usr/bin/env node
-const { readFileSync, existsSync, mkdirSync, writeFileSync } = require('fs');
-const { join } = require('path');
-const { homedir } = require('os');
+#!/usr/bin/env bun
+// Bun wrapper - loads the original Bun bundle directly
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 
 const claudeDir = join(homedir(), '.claude');
 const clawgodDir = join(homedir(), '.clawgod');
@@ -1522,6 +1500,7 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
   } catch {}
 }
 
+// Load the Bun bundle directly - it's already in Bun format
 require('./cli.original.js');
 WRAPPER_EOF
 chmod +x "$CLAWGOD_DIR/cli.js"
@@ -1667,8 +1646,8 @@ const patches = [
   },
   {
     name: 'Remove cautious actions section',
-    pattern: /function (\w+)\(\)\{return`# Executing actions with care\n\n[\s\S]*?`\}/g,
-    replacer: (m, fn) => `function ${fn}(){return\`\`}`,
+    pattern: /function (\w+)\((\w+)\)\{if\(\w+\(\w+\)==="compact"\)return`# Executing actions with care[\s\S]*?`\}function/g,
+    replacer: (m, fn, arg) => `function ${fn}(${arg}){return\`\`}\nfunction`,
     sentinel: '# Executing actions with care',
   },
   {
@@ -1850,7 +1829,7 @@ if [ ! -f \"\$CLAWGOD_CLI\" ]; then
   echo \"clawgod: or remove this launcher:  rm \\\"\$0\\\"\" >&2
   exit 127
 fi
-exec node \"\$CLAWGOD_CLI\" \"\$@\""
+exec bun \"\$CLAWGOD_CLI\" \"\$@\""
 
 # Detect where claude is actually installed (supports native, npm, pnpm, yarn)
 CLAUDE_BIN=$(which claude 2>/dev/null)
