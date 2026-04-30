@@ -273,15 +273,18 @@ const KNOWN_MODULES = [
 
 function identifyDylib(buf, dylib) {
   const body = buf.slice(dylib.offset, dylib.offset + dylib.size);
-  const bodyStr = body.toString('utf8');
 
-  // Audio detection: ALSA (Linux) or WASAPI (Windows)
-  if (bodyStr.includes('snd_pcm_open') || bodyStr.includes('wasapi') || bodyStr.includes('WASAPI')) {
+  // Audio detection: ALSA (Linux) or WASAPI (Windows) - use binary search
+  if (body.indexOf(Buffer.from('snd_pcm_open')) !== -1 ||
+      body.indexOf(Buffer.from('wasapi')) !== -1 ||
+      body.indexOf(Buffer.from('WASAPI')) !== -1) {
     return 'audio-capture';
   }
 
-  // Image processor detection
-  if (bodyStr.includes('webp') || bodyStr.includes('WEBP') || bodyStr.includes('ImagePro')) {
+  // Image processor detection - use binary search
+  if (body.indexOf(Buffer.from('webp')) !== -1 ||
+      body.indexOf(Buffer.from('WEBP')) !== -1 ||
+      body.indexOf(Buffer.from('ImagePro')) !== -1) {
     return 'image-processor';
   }
 

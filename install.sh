@@ -81,7 +81,10 @@ info "Using Bun runtime"
 mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
 
 dim "Installing @anthropic-ai/claude-code@${VERSION} ..."
-npm install --prefix "$CLAWGOD_DIR" "@anthropic-ai/claude-code@${VERSION}" --save-exact --no-fund --no-audit 2>/dev/null
+if ! npm install --prefix "$CLAWGOD_DIR" "@anthropic-ai/claude-code@${VERSION}" --save-exact --no-fund --no-audit 2>&1; then
+  fail "npm install failed"
+  exit 1
+fi
 INSTALLED_VERSION=$(node -e "console.log(require('$CLAWGOD_DIR/node_modules/@anthropic-ai/claude-code/package.json').version)")
 info "Claude Code v${INSTALLED_VERSION} downloaded"
 
@@ -565,7 +568,9 @@ if (existsSync(configFile)) {
   try {
     const raw = JSON.parse(readFileSync(configFile, 'utf8'));
     config = { ...defaultConfig, ...raw };
-  } catch {}
+  } catch (e) {
+    // Invalid JSON, use defaults
+  }
 } else {
   mkdirSync(providerDir, { recursive: true });
   writeFileSync(configFile, JSON.stringify(defaultConfig, null, 2) + '\n');
@@ -607,7 +612,9 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
     const raw = readFileSync(featuresFile, 'utf8');
     JSON.parse(raw);
     process.env.CLAUDE_INTERNAL_FC_OVERRIDES = raw;
-  } catch {}
+  } catch (e) {
+    // Invalid JSON, skip feature overrides
+  }
 }
 
 await import('./cli.original.js');
@@ -692,6 +699,7 @@ const patches = [
     name: 'Computer Use gate bypass',
     pattern: /function (\w+)\(\)\{return \w+\(\)&&\w+\(\)\.enabled\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
+    sentinel: '.enabled',
   },
   {
     name: 'Voice Mode enable (bypass GrowthBook kill)',
@@ -932,9 +940,19 @@ if [ "$INSTALL_MODE" = "native" ]; then
 NATIVE_BIN=""
 NPM_PKG_DIR="$CLAWGOD_DIR/node_modules/@anthropic-ai/claude-code"
 
+# Helper: get file size in bytes (portable)
+get_file_size() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
+}
+
 # 1. Postinstall-placed binary (bin/claude.exe after npm install runs postinstall)
 PLACED_BIN="$NPM_PKG_DIR/bin/claude.exe"
-if [ -f "$PLACED_BIN" ] && [ "$(stat -c%s "$PLACED_BIN" 2>/dev/null || stat -f%z "$PLACED_BIN" 2>/dev/null || echo 0)" -gt 10000000 ]; then
+if [ "$(get_file_size "$PLACED_BIN")" -gt 10000000 ]; then
   NATIVE_BIN="$PLACED_BIN"
 fi
 
@@ -943,7 +961,7 @@ if [ -z "$NATIVE_BIN" ]; then
   for plat_dir in "$CLAWGOD_DIR/node_modules/@anthropic-ai/claude-code-"*; do
     [ -d "$plat_dir" ] || continue
     for candidate in "$plat_dir/claude" "$plat_dir/claude.exe"; do
-      if [ -f "$candidate" ] && [ "$(stat -c%s "$candidate" 2>/dev/null || stat -f%z "$candidate" 2>/dev/null || echo 0)" -gt 10000000 ]; then
+      if [ "$(get_file_size "$candidate")" -gt 10000000 ]; then
         NATIVE_BIN="$candidate"
         break 2
       fi
@@ -1461,7 +1479,9 @@ if (existsSync(configFile)) {
   try {
     const raw = JSON.parse(readFileSync(configFile, 'utf8'));
     config = { ...defaultConfig, ...raw };
-  } catch {}
+  } catch (e) {
+    // Invalid JSON, use defaults
+  }
 } else {
   mkdirSync(providerDir, { recursive: true });
   writeFileSync(configFile, JSON.stringify(defaultConfig, null, 2) + '\n');
@@ -1497,7 +1517,9 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
     const raw = readFileSync(featuresFile, 'utf8');
     JSON.parse(raw);
     process.env.CLAUDE_INTERNAL_FC_OVERRIDES = raw;
-  } catch {}
+  } catch (e) {
+    // Invalid JSON, skip feature overrides
+  }
 }
 
 // Load the Bun bundle directly - it's already in Bun format
@@ -1579,6 +1601,7 @@ const patches = [
     name: 'Computer Use gate bypass',
     pattern: /function (\w+)\(\)\{return \w+\(\)&&\w+\(\)\.enabled\}/g,
     replacer: (m, fn) => `function ${fn}(){return!0}`,
+    sentinel: '.enabled',
   },
   {
     name: 'Voice Mode enable (bypass GrowthBook kill)',
