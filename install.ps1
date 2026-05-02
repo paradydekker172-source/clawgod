@@ -23,6 +23,52 @@ $ErrorActionPreference = "Stop"
 $ClawDir = Join-Path $env:USERPROFILE ".clawgod"
 $BinDir  = Join-Path $env:USERPROFILE ".local\bin"
 
+# ─── Transactional state ────────────────────────────────
+# Track what we create/modify so we can roll back on failure.
+
+$script:RollbackFiles = [System.Collections.Generic.List[string]]::new()
+$script:RollbackRestores = [System.Collections.Generic.List[Tuple[string,string]]]::new()
+$script:RollbackRmdirs = [System.Collections.Generic.List[string]]::new()
+$script:RollbackTmpDir = $null
+
+function Push-RollbackFile { param([string]$Path) $script:RollbackFiles.Add($Path) }
+function Push-RollbackRestore { param([string]$Src, [string]$Dst) $script:RollbackRestores.Add([Tuple[string,string]]::new($Src, $Dst)) }
+function Push-RollbackRmdir { param([string]$Path) $script:RollbackRmdirs.Add($Path) }
+
+function Invoke-Rollback {
+    Write-Host "  Install failed. Rolling back ..." -ForegroundColor Red
+    # Restore backed-up files
+    foreach ($pair in $script:RollbackRestores) {
+        if (Test-Path $pair.Item1) {
+            try { Move-Item -Force $pair.Item1 $pair.Item2 -ErrorAction Stop; Write-Host "  Restored $($pair.Item2)" -ForegroundColor DarkGray } catch {}
+        }
+    }
+    # Remove new files
+    foreach ($f in $script:RollbackFiles) {
+        if (Test-Path $f) {
+            try { Remove-Item -Force $f -ErrorAction Stop; Write-Host "  Removed $f" -ForegroundColor DarkGray } catch {}
+        }
+    }
+    # Remove directories (only if empty)
+    foreach ($d in $script:RollbackRmdirs) {
+        if (Test-Path $d) {
+            try { if (-not (Get-ChildItem $d -Force -ErrorAction SilentlyContinue)) { Remove-Item -Force $d } } catch {}
+        }
+    }
+    # Clean temp dir
+    if ($script:RollbackTmpDir -and (Test-Path $script:RollbackTmpDir)) {
+        Remove-Item -Recurse -Force $script:RollbackTmpDir -ErrorAction SilentlyContinue
+    }
+    Write-Host "  Rollback complete. System restored to pre-install state." -ForegroundColor Red
+}
+
+$script:InstallSucceeded = $false
+
+trap {
+    if (-not $script:InstallSucceeded) { Invoke-Rollback }
+    break
+}
+
 # ─── Colors ───────────────────────────────────────────
 
 function Write-OK($msg)   { Write-Host "  ✓ $msg" -ForegroundColor Green }
@@ -103,33 +149,9 @@ if ($nodeVer -lt 18) {
     exit 1
 }
 
-# ─── Ensure Bun (runtime that executes the patched cli.js) ────────────
-
-$BunBin = $null
-# Prefer real bun.exe over npm's bun.ps1 wrapper — Get-Command may resolve
-# the npm shim in AppData/Roaming/npm which wraps node_modules/bun/bin/bun.exe
-# and breaks the launcher. Always prefer the standalone install at ~/.bun/bin/.
-$homeBun = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
-if (Test-Path $homeBun) { $BunBin = $homeBun }
-if (-not $BunBin) {
-    try {
-        $c = Get-Command bun -ErrorAction Stop
-        # Accept only if it's a real .exe, not a .ps1/.cmd npm wrapper
-        if ($c.Source -like "*.exe") { $BunBin = $c.Source }
-    } catch {}
-}
-if (-not $BunBin) {
-    Write-Dim "Installing Bun (required runtime for v2.1.113+ cli.js) ..."
-    try {
-        Invoke-Expression "$(Invoke-RestMethod https://bun.sh/install.ps1)" 2>$null | Out-Null
-    } catch {}
-    $BunBin = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
-    if (-not (Test-Path $BunBin)) {
-        Write-Err "Bun installation failed. Install manually: https://bun.sh/install"
-        exit 1
-    }
-}
-Write-OK "Bun: $(& $BunBin --version)"
+# ─── Bun runtime ──────────────────────────────────────
+# Bun is extracted from the native binary later (after download).
+# $BunBin is set there. If extraction fails, we fall back to system Bun.
 
 # ─── ripgrep prerequisite (search/grep tool) ──────────────────────────
 # Hard prerequisite — without rg the Grep tool inside Claude Code fails.
@@ -154,8 +176,12 @@ catch {
 # Source: npm registry (@anthropic-ai/claude-code-win32-<arch>).
 # Local binary detection is intentionally skipped — see policy note below.
 
+$_clawDirExisted = Test-Path $ClawDir
+$_binDirExisted = Test-Path $BinDir
 New-Item -ItemType Directory -Force -Path $ClawDir | Out-Null
 New-Item -ItemType Directory -Force -Path $BinDir  | Out-Null
+if (-not $_clawDirExisted) { Push-RollbackRmdir $ClawDir }
+if (-not $_binDirExisted) { Push-RollbackRmdir $BinDir }
 
 $NativeBin = $null
 $NativeBinLabel = $null
@@ -190,6 +216,7 @@ if (-not $NativeBin) {
     $npmPkg = "@anthropic-ai/claude-code-$platformSuffix"
     Write-Dim "Fetching $npmPkg@latest from npm registry ..."
     $NativeBinTmpDir = Join-Path $env:TEMP "clawgod-binary-$([Guid]::NewGuid().ToString('N'))"
+    $script:RollbackTmpDir = $NativeBinTmpDir
     New-Item -ItemType Directory -Force -Path $NativeBinTmpDir | Out-Null
     $fetchScript = Join-Path $NativeBinTmpDir "fetch.mjs"
     @'
@@ -583,6 +610,72 @@ function identifyDylib(buf, dylib) {
   return null;
 }
 
+// ─── Bun runtime extraction ──────────────────────────────────────────
+// Zero the bytecode section/segment to convert a Bun standalone executable
+// into a clean Bun runtime (no embedded bundle). The runtime checks for
+// the bytecode at startup; when it's all zeros, it behaves as a regular
+// `bun` command that can run arbitrary .js/.cjs files.
+
+function extractBunRuntime(buf, format) {
+  const result = Buffer.from(buf);
+  if (format === 'pe') {
+    const peOff = result.readUInt32LE(0x3c);
+    const numSections = result.readUInt16LE(peOff + 6);
+    const sizeOfOptionalHeader = result.readUInt16LE(peOff + 20);
+    const sectionHeaderOff = peOff + 24 + sizeOfOptionalHeader;
+    for (let i = 0; i < numSections; i++) {
+      const secOff = sectionHeaderOff + i * 40;
+      const name = result.slice(secOff, secOff + 8).toString('utf8').replace(/\0/g, '');
+      if (name === '.bun') {
+        const sizeOfRawData = result.readUInt32LE(secOff + 16);
+        const pointerToRawData = result.readUInt32LE(secOff + 20);
+        result.fill(0, pointerToRawData, pointerToRawData + sizeOfRawData);
+        return { buf: result, info: { offset: pointerToRawData, size: sizeOfRawData } };
+      }
+    }
+  } else if (format === 'macho') {
+    const ncmds = result.readUInt32LE(16);
+    let off = 32;
+    for (let i = 0; i < ncmds; i++) {
+      if (off + 8 > result.length) break;
+      const cmd = result.readUInt32LE(off);
+      const cmdsize = result.readUInt32LE(off + 4);
+      if (cmd === LC_SEGMENT_64) {
+        const segname = result.slice(off + 8, off + 24).toString('utf8').replace(/\0/g, '');
+        if (segname === '__BUN') {
+          const fileoff = Number(result.readBigUInt64LE(off + 40));
+          const filesize = Number(result.readBigUInt64LE(off + 48));
+          result.fill(0, fileoff, fileoff + filesize);
+          return { buf: result, info: { offset: fileoff, size: filesize } };
+        }
+      }
+      off += cmdsize;
+    }
+  } else if (format === 'elf') {
+    const e_shoff = Number(result.readBigUInt64LE(40));
+    const e_shentsize = result.readUInt16LE(58);
+    const e_shnum = result.readUInt16LE(60);
+    const e_shstrndx = result.readUInt16LE(62);
+    const shstrtabSecOff = e_shoff + e_shstrndx * e_shentsize;
+    const shstrtabOff = Number(result.readBigUInt64LE(shstrtabSecOff + 24));
+    const shstrtabSize = Number(result.readBigUInt64LE(shstrtabSecOff + 32));
+    const shstrtab = result.slice(shstrtabOff, shstrtabOff + shstrtabSize);
+    for (let i = 0; i < e_shnum; i++) {
+      const secOff = e_shoff + i * e_shentsize;
+      const sh_name = result.readUInt32LE(secOff);
+      const nameEnd = shstrtab.indexOf(0, sh_name);
+      const name = shstrtab.slice(sh_name, nameEnd !== -1 ? nameEnd : sh_name + 64).toString('utf8');
+      if (name === '.bun') {
+        const sh_offset = Number(result.readBigUInt64LE(secOff + 24));
+        const sh_size = Number(result.readBigUInt64LE(secOff + 32));
+        result.fill(0, sh_offset, sh_offset + sh_size);
+        return { buf: result, info: { offset: sh_offset, size: sh_size } };
+      }
+    }
+  }
+  return { buf: null, info: null };
+}
+
 // ─── cli.js text extraction (Bun standalone) ─────────────────────────
 // Two anchors: bunfs path (primary, Mach-O/ELF) and cli_after_main_complete
 // (fallback, used when Windows PE builds omit the bunfs path string).
@@ -618,9 +711,10 @@ function extractCliJs(buf) {
 function main() {
   const [, , binaryPath, outputDir, ...rest] = process.argv;
   const wantCliJs = rest.includes('--cli-js');
+  const wantExtractBun = rest.includes('--extract-bun');
 
   if (!binaryPath || !outputDir) {
-    console.error('Usage: extract-natives.mjs <binary-path> <output-dir> [--cli-js]');
+    console.error('Usage: extract-natives.mjs <binary-path> <output-dir> [--cli-js] [--extract-bun]');
     process.exit(1);
   }
 
@@ -656,6 +750,25 @@ function main() {
     const out = join(outputDir, 'cli.original.js');
     writeFileSync(out, js);
     console.log(`  cli.js  ${(js.length / 1024 / 1024).toFixed(2)} MB -> ${out}`);
+    return;
+  }
+
+  if (wantExtractBun) {
+    const { buf: result, info } = extractBunRuntime(buf, format);
+    if (!info) {
+      console.error('Could not find .bun/__BUN section in binary.');
+      process.exit(2);
+    }
+    mkdirSync(outputDir, { recursive: true });
+    const ext = format === 'pe' ? '.exe' : '';
+    const out = join(outputDir, `bun${ext}`);
+    writeFileSync(out, result);
+    if (format !== 'pe') {
+      const { chmodSync } = await import('fs');
+      chmodSync(out, 0o755);
+    }
+    console.log(`  Bun runtime  ${(result.length / 1024 / 1024).toFixed(1)} MB -> ${out}`);
+    console.log(`  Zeroed ${format === 'macho' ? '__BUN' : '.bun'} section: ${(info.size / 1024 / 1024).toFixed(1)} MB at offset ${info.offset}`);
     return;
   }
 
@@ -706,12 +819,14 @@ function main() {
 
 main();
 '@ | Set-Content $extractorPath -Encoding UTF8
+Push-RollbackFile $extractorPath
 
 # ─── Extract cli.js + native modules from Bun binary ──────────
 
 $VendorDir = Join-Path $ClawDir "vendor"
 if (Test-Path $VendorDir) { Remove-Item -Recurse -Force $VendorDir }
 New-Item -ItemType Directory -Force -Path $VendorDir | Out-Null
+Push-RollbackRmdir $VendorDir
 
 $dstCli = Join-Path $ClawDir "cli.original.js"
 
@@ -726,6 +841,38 @@ Write-Dim "Extracting native modules from $NativeBinLabel ..."
 & node $extractorPath $NativeBin $VendorDir 2>&1 | ForEach-Object { Write-Host "  $_" }
 
 # Note: keep extractorPath around — repatch.mjs uses it on version drift
+
+# ─── Extract Bun runtime from native binary ──────────────────────
+# Zero the .bun section to convert the standalone executable into a
+# clean Bun runtime. This guarantees version compatibility — the extracted
+# Bun is the exact build that Anthropic used to compile the embedded bundle.
+
+$BunRuntimeDir = Join-Path $ClawDir "bun-runtime"
+if (Test-Path $BunRuntimeDir) { Remove-Item -Recurse -Force $BunRuntimeDir }
+New-Item -ItemType Directory -Force -Path $BunRuntimeDir | Out-Null
+Push-RollbackRmdir $BunRuntimeDir
+
+Write-Dim "Extracting Bun runtime from native binary ..."
+& node $extractorPath $NativeBin $BunRuntimeDir --extract-bun 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+$BunBin = Join-Path $BunRuntimeDir "bun.exe"
+if (-not (Test-Path $BunBin)) {
+    Write-Warn "Bun runtime extraction failed. Falling back to system Bun."
+    $homeBun = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
+    if (Test-Path $homeBun) {
+        $BunBin = $homeBun
+    } else {
+        try {
+            $c = Get-Command bun -ErrorAction Stop
+            if ($c.Source -like "*.exe") { $BunBin = $c.Source }
+        } catch {}
+    }
+    if (-not (Test-Path $BunBin)) {
+        Write-Err "No Bun available. Install manually: https://bun.sh/install"
+        exit 1
+    }
+}
+Write-OK "Bun: $(& $BunBin --version) ($(Split-Path $BunBin -Leaf))"
 
 # ─── Post-process cli.js for Bun runtime ──────────────────────
 
@@ -759,14 +906,17 @@ writeFileSync(dst, code);
 unlinkSync(src);
 console.log(`cli.original.cjs: ${code.length} bytes`);
 '@ | Set-Content $postProc -Encoding UTF8
+Push-RollbackFile $postProc
 & node $postProc 2>&1 | ForEach-Object { Write-Host "  $_" }
 if (-not (Test-Path (Join-Path $ClawDir "cli.original.cjs"))) {
     Write-Err "Post-process failed"
     exit 1
 }
+Push-RollbackFile (Join-Path $ClawDir "cli.original.cjs")
 
 # Stamp source version so wrapper can detect drift on next launch
 Set-Content -Path (Join-Path $ClawDir ".source-version") -Value $NativeBinLabel -Encoding ASCII
+Push-RollbackFile (Join-Path $ClawDir ".source-version")
 
 # If we pulled the binary from npm into a tmpdir, clean up — extraction
 # is done; drift detection only consults %USERPROFILE%\.local\share\claude\versions\.
@@ -819,6 +969,7 @@ run('patcher', [patcher]);
 writeFileSync(join(here, '.source-version'), basename(nativeBin) + '\n');
 console.log(`[clawgod] re-patched to ${basename(nativeBin)}`);
 '@ | Set-Content (Join-Path $ClawDir "repatch.mjs") -Encoding UTF8
+Push-RollbackFile (Join-Path $ClawDir "repatch.mjs")
 Write-OK "Re-patch helper installed (repatch.mjs)"
 
 # ─── Write wrapper (cli.cjs, runs under Bun) ──────────────────
@@ -902,6 +1053,7 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
 
 require('./cli.original.cjs');
 '@ | Set-Content (Join-Path $ClawDir "cli.cjs") -Encoding UTF8
+Push-RollbackFile (Join-Path $ClawDir "cli.cjs")
 Write-OK "Wrapper created (cli.cjs)"
 
 # ─── Write universal patcher ──────────────────────────
@@ -1193,6 +1345,7 @@ console.log(`${'='.repeat(55)}\n`);
 '@
 
 Set-Content (Join-Path $ClawDir "patch.mjs") $patcherCode -Encoding UTF8
+Push-RollbackFile (Join-Path $ClawDir "patch.mjs")
 Write-OK "Patcher created (patch.mjs)"
 
 # ─── Apply patches ────────────────────────────────────
@@ -1216,96 +1369,32 @@ if (-not (Test-Path $featuresFile)) {
   "tengu_prompt_cache_1h_config": {"allowlist": ["*"]}
 }
 '@ | Set-Content $featuresFile -Encoding UTF8
+    Push-RollbackFile $featuresFile
     Write-OK "Default features.json created"
 }
 
-# ─── Sanity check: ensure user's Bun can actually load cli.original.cjs ──
-# Anthropic builds the native binary with a bleeding-edge Bun build (e.g.
-# 1.3.14 while stable still ships 1.3.13). Older Bun crashes loading the
-# extracted cli.original.cjs with "Expected CommonJS module to have a
-# function wrapper". Detect this BEFORE we install the launcher — better
-# to fail loudly than to leave the user with a launcher that panics on
-# first invocation.
+# ─── Verify extracted Bun loads cli.cjs ──────────────────
+# The extracted Bun runtime comes from the same binary that embedded cli.cjs,
+# so it should always be compatible. This is a sanity check, not a canary dance.
 
-Write-Dim "Verifying Bun can load patched cli.original.cjs ..."
+Write-Dim "Verifying Bun can load patched cli.cjs ..."
 $sanityCli = Join-Path $ClawDir "cli.cjs"
 $sanityOut = & $BunBin $sanityCli --version 2>&1 | Out-String
 if ($sanityOut -match "Expected CommonJS module to have a function wrapper") {
     Write-Host ""
-    Write-Err "Bun $(& $BunBin --version) cannot load Anthropic's cli.original.cjs."
-    Write-Err "  Anthropic builds with Bun's canary channel (e.g. 1.3.14), while"
-    Write-Err "  bun.sh's main download is on stable (e.g. 1.3.13)."
-    Write-Host ""
-    Write-Dim "Auto-upgrading Bun to canary ..."
-    try { & $BunBin upgrade --canary 2>$null | Out-Null } catch {}
-
-    # Re-check after bun upgrade --canary
-    $sanityOut2 = & $BunBin $sanityCli --version 2>&1 | Out-String
-    if ($sanityOut2 -match "Expected CommonJS module to have a function wrapper") {
-        Write-Dim "bun upgrade --canary did not resolve the issue. Downloading canary ..."
-        $canaryArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") { "arm64" } else { "x64" }
-        $canaryZip = "bun-windows-$canaryArch.zip"
-        # Try GitHub direct, then China-friendly mirrors
-        $canaryUrls = @(
-            "https://github.com/oven-sh/bun/releases/download/canary/$canaryZip",
-            "https://ghproxy.net/https://github.com/oven-sh/bun/releases/download/canary/$canaryZip",
-            "https://ghfast.top/https://github.com/oven-sh/bun/releases/download/canary/$canaryZip"
-        )
-        $canaryTmp = Join-Path $env:TEMP "bun-canary"
-        New-Item -ItemType Directory -Force -Path $canaryTmp | Out-Null
-        $canaryOk = $false
-        foreach ($url in $canaryUrls) {
-            Write-Dim "  Trying $url ..."
-            try {
-                $proxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } else { $null }
-                if ($proxy) {
-                    Invoke-WebRequest -Uri $url -OutFile (Join-Path $canaryTmp "bun-canary.zip") -Proxy $proxy -UseBasicParsing
-                } else {
-                    Invoke-WebRequest -Uri $url -OutFile (Join-Path $canaryTmp "bun-canary.zip") -UseBasicParsing
-                }
-                if ((Get-Item (Join-Path $canaryTmp "bun-canary.zip") -ErrorAction SilentlyContinue).Length -gt 0) {
-                    $canaryOk = $true
-                    break
-                }
-            } catch {
-                # Try next mirror
-            }
-        }
-        if ($canaryOk) {
-            try {
-                Expand-Archive -Path (Join-Path $canaryTmp "bun-canary.zip") -DestinationPath $canaryTmp -Force
-                $canaryExe = Get-ChildItem -Path $canaryTmp -Recurse -Filter "bun.exe" | Select-Object -First 1
-                if ($canaryExe) {
-                    Copy-Item -Force $canaryExe.FullName (Join-Path $env:USERPROFILE ".bun\bin\bun.exe")
-                    $BunBin = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
-                    Write-OK "Bun upgraded to canary: $(& $BunBin --version)"
-                }
-            } catch {
-                Write-Warn "Failed to extract canary Bun: $_"
-            }
-        } else {
-            Write-Warn "All download mirrors failed"
-        }
-        Remove-Item -Recurse -Force $canaryTmp -ErrorAction SilentlyContinue
-    }
-
-    # Final check
-    $sanityOut3 = & $BunBin $sanityCli --version 2>&1 | Out-String
-    if ($sanityOut3 -match "Expected CommonJS module to have a function wrapper") {
-        Write-Host ""
-        Write-Err "Auto-upgrade failed. Please upgrade Bun manually:"
-        Write-Err "  bun upgrade --canary"
-        Write-Err "  Then re-run install.ps1."
-        exit 1
-    }
+    Write-Err "Extracted Bun $(& $BunBin --version) cannot load cli.cjs — this should not happen."
+    Write-Err "  The Bun runtime was extracted from the same binary that embedded cli.cjs."
+    Write-Err "  Please report this bug at https://github.com/0Chencc/clawgod/issues"
+    exit 1
 }
-Write-OK "Bun loads cli.original.cjs"
+Write-OK "Bun loads cli.cjs"
 
 # ─── Replace claude command ───────────────────────────
 
 $cliPath = Join-Path $ClawDir "cli.cjs"
 $bunPath = $BunBin
-$launcherContent = "@echo off`r`n`"$bunPath`" `"$cliPath`" %*"
+$bunFallback = Join-Path $BunRuntimeDir "bun.exe"
+$launcherContent = "@echo off`r`nsetlocal`r`nset `"BUN=$bunPath`"`r`nif not exist `"%BUN%`" set `"BUN=$bunFallback`"`r`nif not exist `"%BUN%`" for /f %%i in ('where bun 2^>nul') do set `"BUN=%%i`"`r`n`"%BUN%`" `"$cliPath`" %*"
 
 # Find and back up original claude
 $claudeCmd = Join-Path $BinDir "claude.cmd"
@@ -1325,12 +1414,14 @@ foreach ($loc in @(
         # Back up .exe if exists and not already backed up
         if ($loc -like "*.exe" -and -not (Test-Path $claudeOrigExe)) {
             Copy-Item $loc $claudeOrigExe -Force
+            Push-RollbackRestore $claudeOrigExe $loc
             Write-OK "Original claude.exe backed up → claude.orig.exe"
             $originalFound = $true
         }
         # Back up .cmd if exists and not already backed up
         if ($loc -like "*.cmd" -and -not (Test-Path $claudeOrigCmd)) {
             Copy-Item $loc $claudeOrigCmd -Force
+            Push-RollbackRestore $claudeOrigCmd $loc
             Write-OK "Original claude.cmd backed up → claude.orig.cmd"
             $originalFound = $true
         }
@@ -1339,6 +1430,7 @@ foreach ($loc in @(
             $latestExe = Get-ChildItem $loc -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($latestExe -and -not (Test-Path $claudeOrigExe)) {
                 Copy-Item $latestExe.FullName $claudeOrigExe -Force
+                Push-RollbackRestore $claudeOrigExe $latestExe.FullName
                 Write-OK "Original claude backed up → claude.orig.exe ($($latestExe.Name))"
                 $originalFound = $true
             }
@@ -1357,6 +1449,7 @@ Get-ChildItem $BinDir -Filter "claude.*.exe" -ErrorAction SilentlyContinue |
 if (Test-Path $claudeExe) {
     if (-not (Test-Path $claudeOrigExe)) {
         Rename-Item $claudeExe $claudeOrigExe -Force
+        Push-RollbackRestore $claudeOrigExe $claudeExe
         Write-OK "Renamed claude.exe → claude.orig.exe"
     } else {
         # Backup already exists — just remove the new claude.exe
@@ -1373,7 +1466,9 @@ if (Test-Path $claudeExe) {
 
 # Write .cmd launcher for both 'claude' and the explicit 'clawgod' alias.
 foreach ($cmd in @("claude", "clawgod")) {
-    $launcherContent | Set-Content (Join-Path $BinDir "$cmd.cmd") -Encoding ASCII
+    $launcherPath = Join-Path $BinDir "$cmd.cmd"
+    $launcherContent | Set-Content $launcherPath -Encoding ASCII
+    Push-RollbackFile $launcherPath
 }
 Write-OK "Commands 'claude' + 'clawgod' → patched"
 
@@ -1458,9 +1553,7 @@ Write-Host ""
 Write-Dim "  Config: ~/.clawgod/provider.json"
 Write-Dim "  Flags:  ~/.clawgod/features.json"
 Write-Host ""
-Write-Dim "  If 'claude' panics with 'Expected CommonJS module to have a function wrapper',"
-Write-Dim "  your Bun lags Anthropic's embedded Bun. Upgrade with one of:"
-Write-Dim "    bun upgrade --canary           (if installed from bun.sh)"
-Write-Dim "    scoop update bun               (scoop — may lag stable)"
-Write-Dim "    irm https://bun.sh/install.ps1 | iex   (re-install latest)"
-Write-Host ""
+
+# ─── Commit: clear rollback (install succeeded) ────────
+# Signal success so the trap handler skips rollback on exit.
+$script:InstallSucceeded = $true

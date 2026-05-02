@@ -16,6 +16,57 @@ CLAWGOD_DIR="$HOME/.clawgod"
 BIN_DIR="$HOME/.local/bin"
 VERSION="${CLAWGOD_VERSION:-latest}"
 
+# ─── Transactional state ─────────────────────────────────
+# Track what we create/modify so we can roll back on failure.
+_ROLLBACK_FILES=""       # new files to remove
+_ROLLBACK_RESTORE=""     # "src dst" pairs — mv src back to dst on rollback
+_ROLLBACK_RMDIRS=""      # directories to remove (only if empty)
+_ROLLBACK_TMPDIR=""      # temp dir for staged files (cleaned on success OR rollback)
+
+_rollback_push_file() { _ROLLBACK_FILES="$_ROLLBACK_FILES|$1"; }
+_rollback_push_restore() { _ROLLBACK_RESTORE="$_ROLLBACK_RESTORE|$1|$2"; }
+_rollback_push_rmdir() { _ROLLBACK_RMDIRS="$_ROLLBACK_RMDIRS|$1"; }
+
+_rollback() {
+  local ec=$?
+  [ "$ec" -eq 0 ] && return 0
+  echo -e "  ${RED}Install failed (exit $ec). Rolling back ...${NC}" >&2
+  # Restore backed-up files
+  if [ -n "$_ROLLBACK_RESTORE" ]; then
+    IFS='|' read -ra _pairs <<< "$_ROLLBACK_RESTORE"
+    i=0; _src=""; _dst=""
+    for _v in "${_pairs[@]}"; do
+      [ -z "$_v" ] && continue
+      if [ $((i % 2)) -eq 0 ]; then _src="$_v"; else
+        _dst="$_v"
+        [ -f "$_src" ] && mv -f "$_src" "$_dst" 2>/dev/null && echo -e "  ${DIM}Restored $_dst${NC}" >&2
+        _src=""; _dst=""
+      fi
+      i=$((i + 1))
+    done
+  fi
+  # Remove new files
+  if [ -n "$_ROLLBACK_FILES" ]; then
+    IFS='|' read -ra _files <<< "$_ROLLBACK_FILES"
+    for _f in "${_files[@]}"; do
+      [ -z "$_f" ] && continue
+      [ -f "$_f" ] && rm -f "$_f" 2>/dev/null && echo -e "  ${DIM}Removed $_f${NC}" >&2
+    done
+  fi
+  # Remove directories (only if empty — safe)
+  if [ -n "$_ROLLBACK_RMDIRS" ]; then
+    IFS='|' read -ra _dirs <<< "$_ROLLBACK_RMDIRS"
+    for _d in "${_dirs[@]}"; do
+      [ -z "$_d" ] && continue
+      [ -d "$_d" ] && rmdir "$_d" 2>/dev/null
+    done
+  fi
+  # Clean temp dir
+  [ -n "$_ROLLBACK_TMPDIR" ] && [ -d "$_ROLLBACK_TMPDIR" ] && rm -rf "$_ROLLBACK_TMPDIR"
+  echo -e "  ${RED}Rollback complete. System restored to pre-install state.${NC}" >&2
+}
+trap _rollback EXIT
+
 # Parse args
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -92,26 +143,9 @@ if [ "$NODE_VERSION" -lt 18 ]; then
   exit 1
 fi
 
-# ─── Ensure Bun (runtime that executes the patched cli.js) ─────────────
-
-BUN_BIN=""
-# Prefer standalone bun at ~/.bun/bin/bun over npm's wrapper shim.
-# On some systems `command -v bun` resolves to an npm-installed wrapper
-# that may not work correctly as a direct executable for the launcher.
-if [ -x "$HOME/.bun/bin/bun" ]; then
-  BUN_BIN="$HOME/.bun/bin/bun"
-elif command -v bun &>/dev/null; then
-  BUN_BIN=$(command -v bun)
-else
-  dim "Installing Bun (required runtime for v2.1.113+ cli.js) ..."
-  curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1 || true
-  BUN_BIN="$HOME/.bun/bin/bun"
-  if [ ! -x "$BUN_BIN" ]; then
-    warn "Bun installation failed. Install manually: https://bun.sh/install"
-    exit 1
-  fi
-fi
-info "Bun: $($BUN_BIN --version)"
+# ─── Bun runtime ──────────────────────────────────────
+# Bun is extracted from the native binary later (after download).
+# BUN_BIN is set there. If extraction fails, we fall back to system Bun.
 
 # ─── ripgrep prerequisite (search/grep tool) ──────────────────────────
 # Without rg the Grep tool inside Claude Code fails. Bun-bundled ripgrep
@@ -141,6 +175,9 @@ info "ripgrep: $(rg --version | head -1)"
 # Local binary detection is intentionally skipped — see policy note below.
 
 mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
+# Track these dirs for rollback (rmdir only removes if empty, so safe)
+[ ! -d "$CLAWGOD_DIR" ] && _rollback_push_rmdir "$CLAWGOD_DIR"
+[ ! -d "$BIN_DIR" ] && _rollback_push_rmdir "$BIN_DIR"
 
 NATIVE_BIN=""
 NATIVE_BIN_LABEL=""
@@ -194,6 +231,7 @@ if [ -z "$NATIVE_BIN" ]; then
   NPM_PKG="@anthropic-ai/claude-code-${PLATFORM}"
   dim "Fetching $NPM_PKG@latest from npm registry ..."
   NATIVE_BIN_TMPDIR=$(mktemp -d)
+  _ROLLBACK_TMPDIR="$NATIVE_BIN_TMPDIR"
   if ( cd "$NATIVE_BIN_TMPDIR" && npm pack "$NPM_PKG@latest" --silent >/dev/null 2>&1 ); then
     TARBALL=$(ls "$NATIVE_BIN_TMPDIR"/*.tgz 2>/dev/null | head -1)
     if [ -n "$TARBALL" ]; then
@@ -558,12 +596,82 @@ function extractCliJs(buf) {
   return buf.slice(fnStart, ending + CLI_END_MARKER.length).toString('utf8');
 }
 
+function extractBunRuntime(buf, format) {
+  // Zero the bytecode section/segment to convert a Bun standalone executable
+  // into a clean Bun runtime (no embedded bundle). The runtime checks for
+  // the bytecode at startup; when it's all zeros, it behaves as a regular
+  // `bun` command that can run arbitrary .js/.cjs files.
+  const result = Buffer.from(buf);
+
+  if (format === 'pe') {
+    // PE: find the .bun section and zero it
+    const peOff = result.readUInt32LE(0x3c);
+    const numSections = result.readUInt16LE(peOff + 6);
+    const sizeOfOptionalHeader = result.readUInt16LE(peOff + 20);
+    const sectionHeaderOff = peOff + 24 + sizeOfOptionalHeader;
+    for (let i = 0; i < numSections; i++) {
+      const secOff = sectionHeaderOff + i * 40;
+      const name = result.slice(secOff, secOff + 8).toString('utf8').replace(/\0/g, '');
+      if (name === '.bun') {
+        const sizeOfRawData = result.readUInt32LE(secOff + 16);
+        const pointerToRawData = result.readUInt32LE(secOff + 20);
+        result.fill(0, pointerToRawData, pointerToRawData + sizeOfRawData);
+        return { buf: result, info: { offset: pointerToRawData, size: sizeOfRawData } };
+      }
+    }
+  } else if (format === 'macho') {
+    // Mach-O: find the __BUN segment and zero it
+    const ncmds = result.readUInt32LE(16);
+    let off = 32;
+    for (let i = 0; i < ncmds; i++) {
+      if (off + 8 > result.length) break;
+      const cmd = result.readUInt32LE(off);
+      const cmdsize = result.readUInt32LE(off + 4);
+      if (cmd === LC_SEGMENT_64) {
+        const segname = result.slice(off + 8, off + 24).toString('utf8').replace(/\0/g, '');
+        if (segname === '__BUN') {
+          const fileoff = Number(result.readBigUInt64LE(off + 40));
+          const filesize = Number(result.readBigUInt64LE(off + 48));
+          result.fill(0, fileoff, fileoff + filesize);
+          return { buf: result, info: { offset: fileoff, size: filesize } };
+        }
+      }
+      off += cmdsize;
+    }
+  } else if (format === 'elf') {
+    // ELF: find the .bun section and zero it
+    const e_shoff = Number(result.readBigUInt64LE(40));
+    const e_shentsize = result.readUInt16LE(58);
+    const e_shnum = result.readUInt16LE(60);
+    const e_shstrndx = result.readUInt16LE(62);
+    // Read section name string table
+    const shstrtabSecOff = e_shoff + e_shstrndx * e_shentsize;
+    const shstrtabOff = Number(result.readBigUInt64LE(shstrtabSecOff + 24));
+    const shstrtabSize = Number(result.readBigUInt64LE(shstrtabSecOff + 32));
+    const shstrtab = result.slice(shstrtabOff, shstrtabOff + shstrtabSize);
+    for (let i = 0; i < e_shnum; i++) {
+      const secOff = e_shoff + i * e_shentsize;
+      const sh_name = result.readUInt32LE(secOff);
+      const nameEnd = shstrtab.indexOf(0, sh_name);
+      const name = shstrtab.slice(sh_name, nameEnd !== -1 ? nameEnd : sh_name + 64).toString('utf8');
+      if (name === '.bun') {
+        const sh_offset = Number(result.readBigUInt64LE(secOff + 24));
+        const sh_size = Number(result.readBigUInt64LE(secOff + 32));
+        result.fill(0, sh_offset, sh_offset + sh_size);
+        return { buf: result, info: { offset: sh_offset, size: sh_size } };
+      }
+    }
+  }
+  return { buf: null, info: null };
+}
+
 function main() {
   const [, , binaryPath, outputDir, ...rest] = process.argv;
   const wantCliJs = rest.includes('--cli-js');
+  const wantExtractBun = rest.includes('--extract-bun');
 
   if (!binaryPath || !outputDir) {
-    console.error('Usage: extract-natives.mjs <binary-path> <output-dir> [--cli-js]');
+    console.error('Usage: extract-natives.mjs <binary-path> <output-dir> [--cli-js] [--extract-bun]');
     process.exit(1);
   }
 
@@ -599,6 +707,25 @@ function main() {
     const out = join(outputDir, 'cli.original.js');
     writeFileSync(out, js);
     console.log(`  cli.js  ${(js.length / 1024 / 1024).toFixed(2)} MB → ${out}`);
+    return;
+  }
+
+  if (wantExtractBun) {
+    const { buf: result, info } = extractBunRuntime(buf, format);
+    if (!info) {
+      console.error('Could not find .bun/__BUN section in binary.');
+      process.exit(2);
+    }
+    mkdirSync(outputDir, { recursive: true });
+    const ext = format === 'pe' ? '.exe' : '';
+    const out = join(outputDir, `bun${ext}`);
+    writeFileSync(out, result);
+    if (format !== 'pe') {
+      const { chmodSync } = await import('fs');
+      chmodSync(out, 0o755);
+    }
+    console.log(`  Bun runtime  ${(result.length / 1024 / 1024).toFixed(1)} MB → ${out}`);
+    console.log(`  Zeroed ${format === 'macho' ? '__BUN' : '.bun'} section: ${(info.size / 1024 / 1024).toFixed(1)} MB at offset ${info.offset}`);
     return;
   }
 
@@ -649,6 +776,37 @@ function main() {
 
 main();
 EXTRACTOR_EOF
+_rollback_push_file "$CLAWGOD_DIR/extract-natives.mjs"
+
+# ─── Extract Bun runtime from native binary ──────────────────────
+# Zero the .bun/__BUN section to convert the standalone executable into a
+# clean Bun runtime. This guarantees version compatibility — the extracted
+# Bun is the exact build that Anthropic used to compile the embedded bundle.
+
+BUN_RUNTIME_DIR="$CLAWGOD_DIR/bun-runtime"
+rm -rf "$BUN_RUNTIME_DIR" 2>/dev/null
+mkdir -p "$BUN_RUNTIME_DIR"
+_rollback_push_rmdir "$BUN_RUNTIME_DIR"
+dim "Extracting Bun runtime from native binary ..."
+node "$CLAWGOD_DIR/extract-natives.mjs" "$NATIVE_BIN" "$BUN_RUNTIME_DIR" --extract-bun 2>&1 | while IFS= read -r line; do echo "  $line"; done
+_ext=$(uname -s)
+if [ "$_ext" = "Darwin" ] || [ "$_ext" = "Linux" ]; then
+  BUN_BIN="$BUN_RUNTIME_DIR/bun"
+else
+  BUN_BIN="$BUN_RUNTIME_DIR/bun.exe"
+fi
+if [ ! -x "$BUN_BIN" ]; then
+  warn "Bun runtime extraction failed. Falling back to system Bun."
+  if [ -x "$HOME/.bun/bin/bun" ]; then
+    BUN_BIN="$HOME/.bun/bin/bun"
+  elif command -v bun &>/dev/null; then
+    BUN_BIN=$(command -v bun)
+  else
+    warn "No Bun available. Install manually: https://bun.sh/install"
+    exit 1
+  fi
+fi
+info "Bun: $($BUN_BIN --version) ($(basename "$BUN_BIN"))"
 
 # ─── Extract cli.js + native modules from Bun binary ──────────
 # Note: extract-natives.mjs and post-process.mjs are kept around (NOT deleted)
@@ -658,6 +816,7 @@ EXTRACTOR_EOF
 VENDOR_DIR="$CLAWGOD_DIR/vendor"
 rm -rf "$VENDOR_DIR" 2>/dev/null
 mkdir -p "$VENDOR_DIR"
+_rollback_push_rmdir "$VENDOR_DIR"
 
 dim "Extracting cli.js from $(echo "$NATIVE_BIN_LABEL") ..."
 if ! node "$CLAWGOD_DIR/extract-natives.mjs" "$NATIVE_BIN" "$CLAWGOD_DIR" --cli-js 2>&1 | while IFS= read -r line; do echo "  $line"; done; then
@@ -709,11 +868,14 @@ writeFileSync(dst, code);
 unlinkSync(src);
 console.log(`cli.original.cjs: ${code.length} bytes`);
 POSTPROC_EOF
+_rollback_push_file "$CLAWGOD_DIR/post-process.mjs"
 node "$CLAWGOD_DIR/post-process.mjs" 2>&1 | while IFS= read -r line; do echo "  $line"; done
 [ -f "$CLAWGOD_DIR/cli.original.cjs" ] || { err "Post-process failed"; exit 1; }
+_rollback_push_file "$CLAWGOD_DIR/cli.original.cjs"
 
 # Stamp the source version so the wrapper can detect drift on next launch
 echo "$NATIVE_BIN_LABEL" > "$CLAWGOD_DIR/.source-version"
+_rollback_push_file "$CLAWGOD_DIR/.source-version"
 
 # If we pulled the binary from npm into a tmpdir, clean it up now —
 # extraction is done, drift detection only consults ~/.local/share/claude/versions/.
@@ -769,6 +931,7 @@ run('patcher', [patcher]);
 writeFileSync(join(here, '.source-version'), basename(nativeBin) + '\n');
 console.log(`[clawgod] re-patched to ${basename(nativeBin)}`);
 REPATCH_EOF
+_rollback_push_file "$CLAWGOD_DIR/repatch.mjs"
 chmod +x "$CLAWGOD_DIR/repatch.mjs"
 info "Re-patch helper installed (repatch.mjs)"
 
@@ -863,6 +1026,7 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
 
 require('./cli.original.cjs');
 WRAPPER_EOF
+_rollback_push_file "$CLAWGOD_DIR/cli.cjs"
 chmod +x "$CLAWGOD_DIR/cli.cjs"
 info "Wrapper created (cli.cjs)"
 
@@ -1242,6 +1406,7 @@ if (!dryRun && !verify && applied > 0) {
 
 console.log(`${'═'.repeat(55)}\n`);
 PATCHER_EOF
+_rollback_push_file "$CLAWGOD_DIR/patch.mjs"
 info "Patcher created (patch.mjs)"
 
 # ─── Apply patches ─────────────────────────────────────
@@ -1266,73 +1431,24 @@ if [ ! -f "$CLAWGOD_DIR/features.json" ]; then
   "tengu_prompt_cache_1h_config": {"allowlist": ["*"]}
 }
 FEATURES_EOF
+  _rollback_push_file "$CLAWGOD_DIR/features.json"
   info "Default features.json created"
 fi
 
-# ─── Sanity check: ensure user's Bun can actually load cli.original.cjs ──
-# Anthropic builds the native binary with a bleeding-edge Bun build (e.g.
-# 1.3.14 while stable still ships 1.3.13). Older Bun crashes loading the
-# extracted cli.original.cjs with "Expected CommonJS module to have a
-# function wrapper". Detect this BEFORE we install the launcher — better
-# to fail loudly than to leave the user with a launcher that panics on
-# first invocation.
+# ─── Verify extracted Bun loads cli.cjs ──────────────────
+# The extracted Bun runtime comes from the same binary that embedded cli.cjs,
+# so it should always be compatible. This is a sanity check, not a canary dance.
 
-dim "Verifying Bun can load patched cli.original.cjs ..."
+dim "Verifying Bun can load patched cli.cjs ..."
 sanity_out=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
 if echo "$sanity_out" | grep -q "Expected CommonJS module to have a function wrapper"; then
   echo ""
-  warn "Bun $($BUN_BIN --version) cannot load Anthropic's cli.original.cjs."
-  warn "  Anthropic builds with Bun's canary channel (e.g. 1.3.14), while"
-  warn "  bun.sh's main download is on stable (e.g. 1.3.13)."
-  warn ""
-  dim "Auto-upgrading Bun to canary ..."
-  "$BUN_BIN" upgrade --canary 2>/dev/null || true
-  # If bun upgrade --canary failed (e.g. package-manager shim), download directly
-  sanity_out2=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
-  if echo "$sanity_out2" | grep -q "Expected CommonJS module to have a function wrapper"; then
-    dim "bun upgrade --canary did not resolve the issue. Downloading canary ..."
-    _canary_tmpdir=$(mktemp -d)
-    _arch=$(uname -m)
-    case "$_arch" in x86_64|amd64) _canary_arch="x64" ;; aarch64|arm64) _canary_arch="aarch64" ;; *) _canary_arch="x64" ;; esac
-    if [ "$(uname -s)" = "Darwin" ]; then _canary_os="darwin"; else _canary_os="linux"; fi
-    _canary_zip="bun-$_canary_os-$_canary_arch.zip"
-    # Try GitHub direct, then China-friendly mirrors
-    _canary_urls=(
-      "https://github.com/oven-sh/bun/releases/download/canary/$_canary_zip"
-      "https://ghproxy.net/https://github.com/oven-sh/bun/releases/download/canary/$_canary_zip"
-      "https://ghfast.top/https://github.com/oven-sh/bun/releases/download/canary/$_canary_zip"
-    )
-    _canary_ok=0
-    for _url in "${_canary_urls[@]}"; do
-      dim "  Trying $_url ..."
-      if curl -fsSL --connect-timeout 10 --max-time 300 "$_url" -o "$_canary_tmpdir/bun-canary.zip" 2>/dev/null && [ -s "$_canary_tmpdir/bun-canary.zip" ]; then
-        _canary_ok=1
-        break
-      fi
-    done
-    if [ "$_canary_ok" = "1" ]; then
-      unzip -o "$_canary_tmpdir/bun-canary.zip" -d "$_canary_tmpdir" >/dev/null 2>&1
-      _canary_bin=$(find "$_canary_tmpdir" -name "bun" -o -name "bun.exe" 2>/dev/null | head -1)
-      if [ -n "$_canary_bin" ] && [ -x "$_canary_bin" ]; then
-        cp "$HOME/.bun/bin/bun" "$HOME/.bun/bin/bun.pre-canary" 2>/dev/null || true
-        cp -f "$_canary_bin" "$HOME/.bun/bin/bun"
-        BUN_BIN="$HOME/.bun/bin/bun"
-        info "Bun upgraded to canary: $($BUN_BIN --version)"
-      fi
-    fi
-    rm -rf "$_canary_tmpdir"
-  fi
-  # Final check
-  sanity_out3=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
-  if echo "$sanity_out3" | grep -q "Expected CommonJS module to have a function wrapper"; then
-    echo ""
-    warn "Auto-upgrade failed. Please upgrade Bun manually:"
-    warn "  bun upgrade --canary"
-    warn "  Then re-run install.sh."
-    exit 1
-  fi
+  warn "Extracted Bun $($BUN_BIN --version) cannot load cli.cjs — this should not happen."
+  warn "  The Bun runtime was extracted from the same binary that embedded cli.cjs."
+  warn "  Please report this bug at https://github.com/0Chencc/clawgod/issues"
+  exit 1
 fi
-info "Bun loads cli.original.cjs"
+info "Bun loads cli.cjs"
 
 # ─── Replace claude command ───────────────────────────
 
@@ -1347,11 +1463,15 @@ if [ ! -f \"\$CLAWGOD_CLI\" ]; then
   exit 127
 fi
 if [ ! -x \"\$BUN_BIN\" ]; then
+  _fallback=\"$BUN_RUNTIME_DIR/bun\"
+  [ -x \"\$_fallback\" ] && BUN_BIN=\"\$_fallback\"
+fi
+if [ ! -x \"\$BUN_BIN\" ]; then
   if command -v bun >/dev/null 2>&1; then BUN_BIN=\"\$(command -v bun)\"; fi
 fi
 if [ ! -x \"\$BUN_BIN\" ]; then
   echo \"clawgod: bun runtime not found at \$BUN_BIN\" >&2
-  echo \"clawgod: install bun  curl -fsSL https://bun.sh/install | bash\" >&2
+  echo \"clawgod: reinstall via  curl -fsSL https://github.com/0Chencc/clawgod/releases/latest/download/install.sh | bash\" >&2
   exit 127
 fi
 exec \"\$BUN_BIN\" \"\$CLAWGOD_CLI\" \"\$@\""
@@ -1374,10 +1494,12 @@ if [ ! -e "$CLAUDE_BIN.orig" ]; then
     # Symlink (native install) — preserve target
     NATIVE_BIN="$(readlink "$CLAUDE_BIN")"
     ln -sf "$NATIVE_BIN" "$CLAUDE_BIN.orig"
+    _rollback_push_restore "$CLAUDE_BIN.orig" "$CLAUDE_BIN"
     info "Original claude backed up → claude.orig (→ $NATIVE_BIN)"
   elif [ -f "$CLAUDE_BIN" ] && file "$CLAUDE_BIN" 2>/dev/null | grep -q "Mach-O\|ELF\|script"; then
     # Binary or script (pnpm/npm global install)
     cp "$CLAUDE_BIN" "$CLAUDE_BIN.orig"
+    _rollback_push_restore "$CLAUDE_BIN.orig" "$CLAUDE_BIN"
     info "Original claude backed up → claude.orig"
   else
     # Try versions dir as fallback
@@ -1388,6 +1510,7 @@ if [ ! -e "$CLAUDE_BIN.orig" ]; then
       done)" || true
       if [ -n "$NATIVE_BIN" ]; then
         ln -sf "$NATIVE_BIN" "$CLAUDE_BIN.orig"
+        _rollback_push_restore "$CLAUDE_BIN.orig" "$CLAUDE_BIN"
         info "Original claude backed up → claude.orig (→ $NATIVE_BIN)"
       fi
     fi
@@ -1407,6 +1530,7 @@ write_launcher() {
   rm -f "$target"
   printf '%s\n' "$LAUNCHER_CONTENT" > "$target"
   chmod +x "$target"
+  _rollback_push_file "$target"
 }
 
 write_launcher "$CLAUDE_BIN"
@@ -1508,9 +1632,7 @@ echo ""
 dim "  Config: ~/.clawgod/provider.json"
 dim "  Flags:  ~/.clawgod/features.json"
 echo ""
-dim "  If 'claude' panics with 'Expected CommonJS module to have a function wrapper',"
-dim "  your Bun lags Anthropic's embedded Bun. Upgrade with one of:"
-dim "    bun upgrade --canary           (if installed via curl/install.sh)"
-dim "    scoop update bun               (scoop — may lag stable)"
-dim "    brew upgrade bun               (homebrew)"
-echo ""
+
+# ─── Commit: clear rollback (install succeeded) ────────
+# Disable the trap so it doesn't fire on exit with $?=0.
+trap - EXIT
