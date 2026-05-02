@@ -114,6 +114,41 @@ if [ "$UNINSTALL" = "1" ]; then
     fi
   done
 
+  # Clean up stale claude launchers in npm's global bin dir.
+  # The installer relies on PATH precedence (~/.local/bin before npm) — after
+  # uninstall, our launcher is gone but npm's claude may still reference the
+  # deleted .clawgod/cli.cjs, leaving a broken command.
+  # If npm dir has .orig backups, restore them; otherwise remove clawgod refs.
+  if command -v npm &>/dev/null; then
+    _npm_prefix=$(npm config get prefix 2>/dev/null || true)
+    _npm_prefix="${_npm_prefix%/bin}"
+    if [ -n "$_npm_prefix" ] && [ -d "$_npm_prefix/bin" ]; then
+      _npm_bindir="$_npm_prefix/bin"
+      for _name in claude clawgod; do
+        _f="$_npm_bindir/$_name"
+        _orig="$_npm_bindir/$_name.orig"
+        if [ -f "$_f" ] && grep -q "clawgod" "$_f" 2>/dev/null; then
+          if [ -f "$_orig" ]; then
+            mv "$_orig" "$_f"
+            info "Restored original npm launcher ($_f)"
+          else
+            rm -f "$_f"
+            info "Removed stale npm launcher ($_f)"
+          fi
+        fi
+      done
+      # Clean up leftover .orig files if the main file was already removed
+      for _name in claude clawgod; do
+        _orig="$_npm_bindir/$_name.orig"
+        _main="$_npm_bindir/$_name"
+        if [ -f "$_orig" ] && [ ! -f "$_main" ]; then
+          mv "$_orig" "$_main"
+          info "Restored original npm launcher ($_main)"
+        fi
+      done
+    fi
+  fi
+
   # No npm file restoration needed — we never replaced them (PATH precedence only)
 
   rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/vendor" "$CLAWGOD_DIR/bun-runtime" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.original.cjs" "$CLAWGOD_DIR/cli.original.cjs.bak" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/cli.cjs" "$CLAWGOD_DIR/patch.mjs" "$CLAWGOD_DIR/patch.js" "$CLAWGOD_DIR/extract-natives.mjs" "$CLAWGOD_DIR/post-process.mjs" "$CLAWGOD_DIR/repatch.mjs" "$CLAWGOD_DIR/.source-version" "$CLAWGOD_DIR/features.json" "$CLAWGOD_DIR/provider.json" "$CLAWGOD_DIR/install.sh" "$CLAWGOD_DIR/install.ps1"

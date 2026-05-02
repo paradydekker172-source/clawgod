@@ -119,6 +119,38 @@ if ($Uninstall) {
     }
     Write-OK "Removed App Paths registry entries"
 
+    # Clean up stale claude launchers in npm's global bin dir.
+    # The installer relies on PATH precedence (.local\bin before npm) — after
+    # uninstall, our launcher is gone but npm's claude.cmd may still reference
+    # the deleted .clawgod\cli.cjs, leaving a broken command.
+    # If npm dir has .orig backups, restore them; otherwise remove clawgod refs.
+    $npmDir = Join-Path $env:APPDATA "npm"
+    foreach ($stem in @("claude", "claude.cmd", "claude.ps1")) {
+        $npmFile = Join-Path $npmDir $stem
+        $npmOrig = Join-Path $npmDir ($stem -replace '^(claude)', '$1.orig')
+        if ((Test-Path $npmFile) -and (Get-Content $npmFile -Raw -ErrorAction SilentlyContinue).Contains("clawgod")) {
+            if (Test-Path $npmOrig) {
+                Move-Item -Force $npmOrig $npmFile
+                Write-OK "Restored original npm launcher ($npmFile)"
+            } else {
+                Remove-Item -Force $npmFile
+                Write-OK "Removed stale npm launcher ($npmFile)"
+            }
+        }
+    }
+    # Clean up leftover .orig files if the main file was already removed
+    foreach ($stem in @("claude.orig", "claude.orig.cmd", "claude.orig.ps1")) {
+        $npmOrig = Join-Path $npmDir $stem
+        if (Test-Path $npmOrig) {
+            $mainStem = $stem -replace '\.orig', ''
+            $npmMain = Join-Path $npmDir $mainStem
+            if (-not (Test-Path $npmMain)) {
+                Move-Item -Force $npmOrig $npmMain
+                Write-OK "Restored original npm launcher ($npmMain)"
+            }
+        }
+    }
+
     # No npm file restoration needed — we never replaced them (PATH precedence only)
 
     foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime","vendor","features.json","provider.json","install.sh","install.ps1")) {
