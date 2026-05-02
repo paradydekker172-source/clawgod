@@ -38,7 +38,7 @@ Write-Host ""
 # ─── Uninstall ────────────────────────────────────────
 
 if ($Uninstall) {
-    # Restore original claude or remove clawgod launcher
+    # Restore original claude or remove clawgod launcher in BinDir
     $claudeOrig = Join-Path $BinDir "claude.orig.cmd"
     $claudeCmd  = Join-Path $BinDir "claude.cmd"
     if (Test-Path $claudeOrig) {
@@ -60,6 +60,27 @@ if ($Uninstall) {
     if (Test-Path $clawgodCmd) {
         Remove-Item -Force $clawgodCmd
         Write-OK "Removed clawgod alias"
+    }
+
+    # Restore npm-installed claude if we replaced it
+    $npmDir = Join-Path $env:APPDATA "npm"
+    $npmClaudeCmd = Join-Path $npmDir "claude.cmd"
+    $npmOrigCmd   = Join-Path $npmDir "claude.orig.cmd"
+    if ((Test-Path $npmOrigCmd) -and (Test-Path $npmClaudeCmd)) {
+        Move-Item -Force $npmOrigCmd $npmClaudeCmd
+        Write-OK "Restored npm claude.cmd"
+    }
+    $npmClaudePs1 = Join-Path $npmDir "claude.ps1"
+    $npmOrigPs1   = Join-Path $npmDir "claude.orig.ps1"
+    if ((Test-Path $npmOrigPs1) -and (Test-Path $npmClaudePs1)) {
+        Move-Item -Force $npmOrigPs1 $npmClaudePs1
+        Write-OK "Restored npm claude.ps1"
+    }
+    $npmClaudeSh = Join-Path $npmDir "claude"
+    $npmOrigSh   = Join-Path $npmDir "claude.orig"
+    if ((Test-Path $npmOrigSh) -and (Test-Path $npmClaudeSh)) {
+        Move-Item -Force $npmOrigSh $npmClaudeSh
+        Write-OK "Restored npm claude (shell)"
     }
 
     foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime","vendor","features.json","provider.json","install.sh","install.ps1")) {
@@ -93,10 +114,17 @@ if ($nodeVer -lt 18) {
 # ─── Ensure Bun (runtime that executes the patched cli.js) ────────────
 
 $BunBin = $null
-try { $BunBin = (Get-Command bun -ErrorAction Stop).Source } catch {}
+# Prefer real bun.exe over npm's bun.ps1 wrapper — Get-Command may resolve
+# the npm shim in AppData/Roaming/npm which wraps node_modules/bun/bin/bun.exe
+# and breaks the launcher. Always prefer the standalone install at ~/.bun/bin/.
+$homeBun = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
+if (Test-Path $homeBun) { $BunBin = $homeBun }
 if (-not $BunBin) {
-    $homeBun = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
-    if (Test-Path $homeBun) { $BunBin = $homeBun }
+    try {
+        $c = Get-Command bun -ErrorAction Stop
+        # Accept only if it's a real .exe, not a .ps1/.cmd npm wrapper
+        if ($c.Source -like "*.exe") { $BunBin = $c.Source }
+    } catch {}
 }
 if (-not $BunBin) {
     Write-Dim "Installing Bun (required runtime for v2.1.113+ cli.js) ..."
@@ -1350,26 +1378,84 @@ if (Test-Path $claudeExe) {
     }
 }
 
-
 # Write .cmd launcher for both 'claude' and the explicit 'clawgod' alias.
-# Why both:
-#  - claude.cmd may be shadowed by a claude.exe higher in PATH
-#  - clawgod.cmd has no .exe competitor, so it always works
-#  - User can invoke patched explicitly via `clawgod` regardless of which
-#    binary 'claude' resolves to
 foreach ($cmd in @("claude", "clawgod")) {
     $launcherContent | Set-Content (Join-Path $BinDir "$cmd.cmd") -Encoding ASCII
 }
 Write-OK "Commands 'claude' + 'clawgod' → patched"
 
-# ─── Ensure BinDir is in PATH ─────────────────────────
+# ─── Handle npm-installed claude (PATH shadowing) ──────────────
+# npm installs claude.cmd / claude.ps1 in AppData/Roaming/npm which
+# may come BEFORE ~/.local/bin in PATH, shadowing our launcher.
+# Back up and replace those too so `claude` always runs clawgod.
+
+$npmDir = Join-Path $env:APPDATA "npm"
+$npmClaudeCmd  = Join-Path $npmDir "claude.cmd"
+$npmClaudePs1  = Join-Path $npmDir "claude.ps1"
+$npmClaudeSh   = Join-Path $npmDir "claude"
+$npmOrigCmd    = Join-Path $npmDir "claude.orig.cmd"
+$npmOrigPs1    = Join-Path $npmDir "claude.orig.ps1"
+$npmOrigSh     = Join-Path $npmDir "claude.orig"
+
+if (Test-Path $npmClaudeCmd) {
+    # Back up original npm claude.cmd if not already backed up
+    if (-not (Test-Path $npmOrigCmd)) {
+        Copy-Item $npmClaudeCmd $npmOrigCmd -Force
+        Write-OK "Backed up npm claude.cmd → claude.orig.cmd"
+    }
+    # Replace with clawgod launcher
+    $launcherContent | Set-Content $npmClaudeCmd -Encoding ASCII
+    Write-OK "Replaced npm claude.cmd → clawgod launcher"
+}
+
+if (Test-Path $npmClaudePs1) {
+    if (-not (Test-Path $npmOrigPs1)) {
+        Copy-Item $npmClaudePs1 $npmOrigPs1 -Force
+        Write-OK "Backed up npm claude.ps1 → claude.orig.ps1"
+    }
+    # Write a PowerShell launcher that calls bun directly
+    $ps1Content = "#!/usr/bin/env pwsh`r`n& `"$bunPath`" `"$cliPath`" @args"
+    $ps1Content | Set-Content $npmClaudePs1 -Encoding UTF8
+    Write-OK "Replaced npm claude.ps1 → clawgod launcher"
+}
+
+if (Test-Path $npmClaudeSh) {
+    if (-not (Test-Path $npmOrigSh)) {
+        Copy-Item $npmClaudeSh $npmOrigSh -Force
+        Write-OK "Backed up npm claude (shell) → claude.orig"
+    }
+    $shContent = "#!/bin/sh`nexec `"$($BunBin -replace '\\','/')`" `"$($cliPath -replace '\\','/')`" `"$@`""
+    $shContent | Set-Content $npmClaudeSh -Encoding UTF8 -NoNewline
+    Write-OK "Replaced npm claude (shell) → clawgod launcher"
+}
+
+# ─── Ensure BinDir is in PATH (before npm dir) ─────────────────
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($userPath -notlike "*$BinDir*") {
+    # Insert BinDir at the very front so it takes priority over npm
     [Environment]::SetEnvironmentVariable("Path", "$BinDir;$userPath", "User")
     $env:Path = "$BinDir;$env:Path"
-    Write-OK "Added $BinDir to user PATH"
+    Write-OK "Added $BinDir to user PATH (front)"
     Write-Dim "(restart terminal for PATH to take effect)"
+} else {
+    # BinDir is in PATH — make sure it's before npm dir
+    $pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
+    $binIdx = -1; $npmIdx = -1
+    for ($i = 0; $i -lt $pathParts.Count; $i++) {
+        if ($pathParts[$i] -ieq $BinDir) { $binIdx = $i }
+        if ($pathParts[$i] -ieq $npmDir) { $npmIdx = $i }
+    }
+    if ($npmIdx -ge 0 -and $binIdx -ge 0 -and $npmIdx -lt $binIdx) {
+        # npm dir comes before BinDir — reorder
+        $pathParts = @($pathParts | Where-Object { $_ -ine $BinDir })
+        $pathParts = , $BinDir + $pathParts
+        $newPath = $pathParts -join ";"
+        [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+        $env:Path = "$BinDir;$env:Path"
+        Write-OK "Moved $BinDir before npm in PATH"
+        Write-Dim "(restart terminal for PATH to take effect)"
+    }
 }
 
 # ─── Done ─────────────────────────────────────────────

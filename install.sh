@@ -61,6 +61,21 @@ if [ "$UNINSTALL" = "1" ]; then
       info "Removed ClawGod alias ($DIR/clawgod)"
     fi
   done
+
+  # Restore npm-installed claude if we replaced it
+  if command -v npm &>/dev/null; then
+    NPM_PREFIX=$(npm config get prefix 2>/dev/null || true)
+    for _npm_candidate in "$NPM_PREFIX" "$HOME/.npm-global" "/usr/local"; do
+      [ -z "$_npm_candidate" ] && continue
+      _npm_claude="$_npm_candidate/bin/claude"
+      _npm_orig="$_npm_claude.orig"
+      if [ -f "$_npm_orig" ] && [ -f "$_npm_claude" ]; then
+        mv "$_npm_orig" "$_npm_claude"
+        info "Restored npm claude ($_npm_candidate/bin)"
+      fi
+    done
+  fi
+
   rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/vendor" "$CLAWGOD_DIR/bun-runtime" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.original.cjs" "$CLAWGOD_DIR/cli.original.cjs.bak" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/cli.cjs" "$CLAWGOD_DIR/patch.mjs" "$CLAWGOD_DIR/patch.js" "$CLAWGOD_DIR/extract-natives.mjs" "$CLAWGOD_DIR/post-process.mjs" "$CLAWGOD_DIR/repatch.mjs" "$CLAWGOD_DIR/.source-version" "$CLAWGOD_DIR/features.json" "$CLAWGOD_DIR/provider.json" "$CLAWGOD_DIR/install.sh" "$CLAWGOD_DIR/install.ps1"
   # Remove .clawgod directory itself if empty
   if [ -d "$CLAWGOD_DIR" ] && [ -z "$(ls -A "$CLAWGOD_DIR" 2>/dev/null)" ]; then
@@ -91,10 +106,13 @@ fi
 # ─── Ensure Bun (runtime that executes the patched cli.js) ─────────────
 
 BUN_BIN=""
-if command -v bun &>/dev/null; then
-  BUN_BIN=$(command -v bun)
-elif [ -x "$HOME/.bun/bin/bun" ]; then
+# Prefer standalone bun at ~/.bun/bin/bun over npm's wrapper shim.
+# On some systems `command -v bun` resolves to an npm-installed wrapper
+# that may not work correctly as a direct executable for the launcher.
+if [ -x "$HOME/.bun/bin/bun" ]; then
   BUN_BIN="$HOME/.bun/bin/bun"
+elif command -v bun &>/dev/null; then
+  BUN_BIN=$(command -v bun)
 else
   dim "Installing Bun (required runtime for v2.1.113+ cli.js) ..."
   curl -fsSL https://bun.sh/install | bash >/dev/null 2>&1 || true
@@ -1425,6 +1443,39 @@ fi
 #  - User restored claude.orig via uninstall but still wants the patched one
 write_launcher "$BIN_DIR/clawgod"
 info "Command 'clawgod' → patched ($BIN_DIR/clawgod)"
+
+# ─── Handle npm-installed claude (PATH shadowing) ──────────────
+# npm installs claude in a global bin dir (e.g. /usr/local/bin or
+# $NPM_CONFIG_PREFIX/bin) which may come BEFORE ~/.local/bin in PATH.
+# Back up and replace those too so `claude` always runs clawgod.
+
+NPM_GLOBAL_DIR=""
+if command -v npm &>/dev/null; then
+  NPM_GLOBAL_DIR=$(npm config get prefix 2>/dev/null || true)
+  # npm prefix on Windows includes /bin suffix in some setups
+  if [ -n "$NPM_GLOBAL_DIR" ] && [ ! -d "$NPM_GLOBAL_DIR" ]; then
+    NPM_GLOBAL_DIR=""
+  fi
+fi
+# Also check common npm global locations
+for _npm_candidate in "$NPM_GLOBAL_DIR" "$HOME/.npm-global" "/usr/local"; do
+  [ -z "$_npm_candidate" ] && continue
+  _npm_claude="$_npm_candidate/bin/claude"
+  # Skip if it's the same file we already replaced
+  if [ "$_npm_claude" = "$CLAUDE_BIN" ] || [ "$_npm_claude" = "$BIN_DIR/claude" ]; then
+    continue
+  fi
+  if [ -f "$_npm_claude" ] && ! grep -q "clawgod" "$_npm_claude" 2>/dev/null; then
+    # Back up original
+    if [ ! -e "$_npm_claude.orig" ]; then
+      cp "$_npm_claude" "$_npm_claude.orig"
+      info "Backed up npm claude → claude.orig ($_npm_candidate/bin)"
+    fi
+    # Replace with our launcher
+    write_launcher "$_npm_claude"
+    info "Replaced npm claude → clawgod launcher ($_npm_candidate/bin)"
+  fi
+done
 
 # ─── Check PATH ───────────────────────────────────────
 
