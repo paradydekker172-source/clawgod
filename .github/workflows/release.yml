@@ -29,6 +29,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Ensure tag exists
+        if: inputs.tag != ''
+        run: |
+          if ! git tag -l "${{ inputs.tag }}" | grep -q .; then
+            git tag "${{ inputs.tag }}"
+          fi
+
       - name: Resolve versions
         id: versions
         run: |
@@ -54,7 +61,7 @@ jobs:
             if [ -n "$prev" ]; then
               git log --pretty='- %s (%h)' "$range"
             else
-              git log --pretty='- %s (%h)' "$tag"
+              git log --pretty='- %s (%h)' HEAD
             fi
             echo
             echo "## Install"
@@ -79,6 +86,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ steps.versions.outputs.tag }}"
+          # Push tag to remote if it only exists locally
+          git push origin "refs/tags/${tag}" 2>/dev/null || true
           if gh release view "$tag" >/dev/null 2>&1; then
             # Release already exists (e.g. created manually with curated notes).
             # Refresh assets only — don't touch notes/title.
