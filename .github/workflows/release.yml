@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.1.4)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,7 +32,7 @@ jobs:
       - name: Resolve versions
         id: versions
         run: |
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ inputs.tag || github.ref_name }}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           prev=$(git tag --sort=-version:refname | grep -v "^${tag}$" | head -n1)
           echo "prev=${prev}" >> "$GITHUB_OUTPUT"
