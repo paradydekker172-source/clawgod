@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -eo pipefail
 
 # ─────────────────────────────────────────────────────────
 #  ClawGod Installer
@@ -34,6 +34,7 @@ NC='\033[0m'
 
 info()  { echo -e "  ${GREEN}✓${NC} $1"; }
 warn()  { echo -e "  ${RED}✗${NC} $1"; }
+err()   { echo -e "  ${RED}✗${NC} $1" >&2; }
 dim()   { echo -e "  ${DIM}$1${NC}"; }
 
 echo ""
@@ -69,8 +70,8 @@ if [ "$UNINSTALL" = "1" ]; then
       [ -z "$_npm_candidate" ] && continue
       _npm_claude="$_npm_candidate/bin/claude"
       _npm_orig="$_npm_claude.orig"
-      if [ -f "$_npm_orig" ] && [ -f "$_npm_claude" ]; then
-        mv "$_npm_orig" "$_npm_claude"
+      if [ -f "$_npm_orig" ]; then
+        mv -f "$_npm_orig" "$_npm_claude"
         info "Restored npm claude ($_npm_candidate/bin)"
       fi
     done
@@ -227,14 +228,6 @@ if [ -z "$NATIVE_BIN" ]; then
     exit 1
   fi
   info "Downloaded $NPM_PKG@$NATIVE_BIN_LABEL"
-fi
-
-if [ -z "$NATIVE_BIN" ]; then
-  warn "Native Claude Code binary not found in $VERSIONS_DIR"
-  warn "Install the official binary first:"
-  warn "  curl -fsSL https://claude.ai/install.sh | bash"
-  warn "Then re-run this script."
-  exit 1
 fi
 
 # Write extractor to a temp file (used both for cli.js and .node modules)
@@ -1324,7 +1317,7 @@ if echo "$sanity_out" | grep -q "Expected CommonJS module to have a function wra
     _canary_ok=0
     for _url in "${_canary_urls[@]}"; do
       dim "  Trying $_url ..."
-      if curl -fsSL --connect-timeout 10 "$_url" -o "$_canary_tmpdir/bun-canary.zip" 2>/dev/null && [ -s "$_canary_tmpdir/bun-canary.zip" ]; then
+      if curl -fsSL --connect-timeout 10 --max-time 300 "$_url" -o "$_canary_tmpdir/bun-canary.zip" 2>/dev/null && [ -s "$_canary_tmpdir/bun-canary.zip" ]; then
         _canary_ok=1
         break
       fi
@@ -1333,6 +1326,7 @@ if echo "$sanity_out" | grep -q "Expected CommonJS module to have a function wra
       unzip -o "$_canary_tmpdir/bun-canary.zip" -d "$_canary_tmpdir" >/dev/null 2>&1
       _canary_bin=$(find "$_canary_tmpdir" -name "bun" -o -name "bun.exe" 2>/dev/null | head -1)
       if [ -n "$_canary_bin" ] && [ -x "$_canary_bin" ]; then
+        cp "$HOME/.bun/bin/bun" "$HOME/.bun/bin/bun.pre-canary" 2>/dev/null || true
         cp -f "$_canary_bin" "$HOME/.bun/bin/bun"
         BUN_BIN="$HOME/.bun/bin/bun"
         info "Bun upgraded to canary: $($BUN_BIN --version)"
@@ -1354,7 +1348,7 @@ info "Bun loads cli.original.cjs"
 
 # ─── Replace claude command ───────────────────────────
 
-LAUNCHER_CONTENT="#!/bin/bash
+LAUNCHER_CONTENT="#!/bin/sh
 # clawgod launcher
 CLAWGOD_CLI=\"$CLAWGOD_DIR/cli.cjs\"
 BUN_BIN=\"$BUN_BIN\"
@@ -1452,7 +1446,8 @@ info "Command 'clawgod' → patched ($BIN_DIR/clawgod)"
 NPM_GLOBAL_DIR=""
 if command -v npm &>/dev/null; then
   NPM_GLOBAL_DIR=$(npm config get prefix 2>/dev/null || true)
-  # npm prefix on Windows includes /bin suffix in some setups
+  # Strip trailing /bin — npm prefix sometimes includes it on Windows/MSYS2
+  NPM_GLOBAL_DIR="${NPM_GLOBAL_DIR%/bin}"
   if [ -n "$NPM_GLOBAL_DIR" ] && [ ! -d "$NPM_GLOBAL_DIR" ]; then
     NPM_GLOBAL_DIR=""
   fi

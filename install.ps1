@@ -66,20 +66,20 @@ if ($Uninstall) {
     $npmDir = Join-Path $env:APPDATA "npm"
     $npmClaudeCmd = Join-Path $npmDir "claude.cmd"
     $npmOrigCmd   = Join-Path $npmDir "claude.orig.cmd"
-    if ((Test-Path $npmOrigCmd) -and (Test-Path $npmClaudeCmd)) {
-        Move-Item -Force $npmOrigCmd $npmClaudeCmd
+    if ((Test-Path $npmOrigCmd)) {
+        Move-Item -Force $npmOrigCmd $npmClaudeCmd -ErrorAction SilentlyContinue
         Write-OK "Restored npm claude.cmd"
     }
     $npmClaudePs1 = Join-Path $npmDir "claude.ps1"
     $npmOrigPs1   = Join-Path $npmDir "claude.orig.ps1"
-    if ((Test-Path $npmOrigPs1) -and (Test-Path $npmClaudePs1)) {
-        Move-Item -Force $npmOrigPs1 $npmClaudePs1
+    if ((Test-Path $npmOrigPs1)) {
+        Move-Item -Force $npmOrigPs1 $npmClaudePs1 -ErrorAction SilentlyContinue
         Write-OK "Restored npm claude.ps1"
     }
     $npmClaudeSh = Join-Path $npmDir "claude"
     $npmOrigSh   = Join-Path $npmDir "claude.orig"
-    if ((Test-Path $npmOrigSh) -and (Test-Path $npmClaudeSh)) {
-        Move-Item -Force $npmOrigSh $npmClaudeSh
+    if ((Test-Path $npmOrigSh)) {
+        Move-Item -Force $npmOrigSh $npmClaudeSh -ErrorAction SilentlyContinue
         Write-OK "Restored npm claude (shell)"
     }
 
@@ -1251,7 +1251,7 @@ if ($sanityOut -match "Expected CommonJS module to have a function wrapper") {
     $sanityOut2 = & $BunBin $sanityCli --version 2>&1 | Out-String
     if ($sanityOut2 -match "Expected CommonJS module to have a function wrapper") {
         Write-Dim "bun upgrade --canary did not resolve the issue. Downloading canary ..."
-        $canaryArch = if ($env:PROCESSOR_ARCHITECTURE -match "ARM64") { "arm64" } else { "x64" }
+        $canaryArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") { "arm64" } else { "x64" }
         $canaryZip = "bun-windows-$canaryArch.zip"
         # Try GitHub direct, then China-friendly mirrors
         $canaryUrls = @(
@@ -1260,6 +1260,7 @@ if ($sanityOut -match "Expected CommonJS module to have a function wrapper") {
             "https://ghfast.top/https://github.com/oven-sh/bun/releases/download/canary/$canaryZip"
         )
         $canaryTmp = Join-Path $env:TEMP "bun-canary"
+        New-Item -ItemType Directory -Force -Path $canaryTmp | Out-Null
         $canaryOk = $false
         foreach ($url in $canaryUrls) {
             Write-Dim "  Trying $url ..."
@@ -1310,8 +1311,8 @@ Write-OK "Bun loads cli.original.cjs"
 
 # ─── Replace claude command ───────────────────────────
 
-$cliPath = (Join-Path $ClawDir "cli.cjs") -replace '\\', '\\'
-$bunPath = $BunBin -replace '\\', '\\'
+$cliPath = Join-Path $ClawDir "cli.cjs"
+$bunPath = $BunBin
 $launcherContent = "@echo off`r`n`"$bunPath`" `"$cliPath`" %*"
 
 # Find and back up original claude
@@ -1425,14 +1426,16 @@ if (Test-Path $npmClaudeSh) {
         Write-OK "Backed up npm claude (shell) → claude.orig"
     }
     $shContent = "#!/bin/sh`nexec `"$($BunBin -replace '\\','/')`" `"$($cliPath -replace '\\','/')`" `"$@`""
-    $shContent | Set-Content $npmClaudeSh -Encoding UTF8 -NoNewline
+    [System.IO.File]::WriteAllText($npmClaudeSh, $shContent)
     Write-OK "Replaced npm claude (shell) → clawgod launcher"
 }
 
 # ─── Ensure BinDir is in PATH (before npm dir) ─────────────────
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if ($userPath -notlike "*$BinDir*") {
+$pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
+$binInPath = $pathParts | Where-Object { $_ -ieq $BinDir }
+if (-not $binInPath) {
     # Insert BinDir at the very front so it takes priority over npm
     [Environment]::SetEnvironmentVariable("Path", "$BinDir;$userPath", "User")
     $env:Path = "$BinDir;$env:Path"
@@ -1440,11 +1443,10 @@ if ($userPath -notlike "*$BinDir*") {
     Write-Dim "(restart terminal for PATH to take effect)"
 } else {
     # BinDir is in PATH — make sure it's before npm dir
-    $pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
     $binIdx = -1; $npmIdx = -1
     for ($i = 0; $i -lt $pathParts.Count; $i++) {
-        if ($pathParts[$i] -ieq $BinDir) { $binIdx = $i }
-        if ($pathParts[$i] -ieq $npmDir) { $npmIdx = $i }
+        if ($pathParts[$i] -ieq $BinDir -and $binIdx -eq -1) { $binIdx = $i }
+        if ($pathParts[$i] -ieq $npmDir -and $npmIdx -eq -1) { $npmIdx = $i }
     }
     if ($npmIdx -ge 0 -and $binIdx -ge 0 -and $npmIdx -lt $binIdx) {
         # npm dir comes before BinDir — reorder

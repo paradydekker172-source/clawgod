@@ -41,7 +41,7 @@ jobs:
         run: |
           tag="${{ inputs.tag || github.ref_name }}"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          prev=$(git tag --sort=-version:refname | grep -v "^${tag}$" | head -n1)
+          prev=$(git tag --sort=-version:refname | grep -vFx "$tag" | head -n1)
           echo "prev=${prev}" >> "$GITHUB_OUTPUT"
           if [ -n "$prev" ]; then
             echo "range=${prev}..${tag}" >> "$GITHUB_OUTPUT"
@@ -61,7 +61,7 @@ jobs:
             if [ -n "$prev" ]; then
               git log --pretty='- %s (%h)' "$range"
             else
-              git log --pretty='- %s (%h)' HEAD
+              git log --pretty='- %s (%h)' "${tag}"
             fi
             echo
             echo "## Install"
@@ -85,7 +85,7 @@ jobs:
             echo
             echo '**Windows (PowerShell):**'
             echo '```powershell'
-            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 -OutFile \$env:TEMP\\clawgod-install.ps1; & \$env:TEMP\\clawgod-install.ps1 -Uninstall"
+            echo 'irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 -OutFile $env:TEMP\clawgod-install.ps1; & $env:TEMP\clawgod-install.ps1 -Uninstall'
             echo '```'
             echo
             echo '> After install/uninstall, restart your terminal or run `hash -r` (bash/zsh) to refresh the command cache.'
