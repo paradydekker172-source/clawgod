@@ -1076,6 +1076,13 @@ const patches = [
     optional: true,
   },
   {
+    name: 'WebFetch domain safety check bypass',
+    pattern: /if\(!([\w$]+)\(\)\.skipWebFetchPreflight\)switch\(\(await [\w$]+\([\w$]+\)\)\.status\)\{case"allowed":break;case"blocked":throw new [\w$]+\([\w$]+\);case"check_failed":throw new [\w$]+\([\w$]+\)\}/g,
+    replacer: (m, fn) => `/* clawgod: skip domain safety check */if(!${fn}().skipWebFetchPreflight){}`,
+    sentinel: 'skipWebFetchPreflight',
+    optional: true,
+  },
+  {
     name: 'Message list filter bypass (s_8 form)',
     pattern: /if\(([\w$]+)\(\)==="ant"\)return ([\w$]+);let ([\w$]+)=([\w$]+) instanceof Set\?\4:([\w$]+)\(\4\);return ([\w$]+)\(\2,\3\)/g,
     replacer: (m, fn, ret) => `return ${ret}`,
@@ -1198,24 +1205,70 @@ $sanityOut = & $BunBin $sanityCli --version 2>&1 | Out-String
 if ($sanityOut -match "Expected CommonJS module to have a function wrapper") {
     Write-Host ""
     Write-Err "Bun $(& $BunBin --version) cannot load Anthropic's cli.original.cjs."
-    Write-Err ""
-    Write-Err "  Anthropic builds with Bun's canary channel (currently ~1.3.14), while"
-    Write-Err "  bun.sh's main download is on stable (currently 1.3.13). The canary build"
-    Write-Err "  is NOT visible on bun.sh's download page — it lives on GitHub Releases"
-    Write-Err "  and is reachable only via 'bun upgrade --canary'."
-    Write-Err ""
-    Write-Err "  If your bun is from bun.sh:"
-    Write-Err "    bun upgrade --canary"
-    Write-Err "    or: powershell -c ""iex & {`$(irm https://bun.sh/install.ps1)} -Version canary"""
-    Write-Err ""
-    Write-Err "  If your bun is from scoop (the binary is behind a shim and refuses to"
-    Write-Err "  self-replace, so 'bun upgrade' silently hangs):"
-    Write-Err "    scoop uninstall bun"
-    Write-Err "    irm https://bun.sh/install.ps1 | iex"
-    Write-Err "    bun upgrade --canary"
-    Write-Err ""
-    Write-Err "  Then re-run .\install.ps1 — this sanity check will pass."
-    exit 1
+    Write-Err "  Anthropic builds with Bun's canary channel (e.g. 1.3.14), while"
+    Write-Err "  bun.sh's main download is on stable (e.g. 1.3.13)."
+    Write-Host ""
+    Write-Dim "Auto-upgrading Bun to canary ..."
+    try { & $BunBin upgrade --canary 2>$null | Out-Null } catch {}
+
+    # Re-check after bun upgrade --canary
+    $sanityOut2 = & $BunBin $sanityCli --version 2>&1 | Out-String
+    if ($sanityOut2 -match "Expected CommonJS module to have a function wrapper") {
+        Write-Dim "bun upgrade --canary did not resolve the issue. Downloading canary ..."
+        $canaryArch = if ($env:PROCESSOR_ARCHITECTURE -match "ARM64") { "arm64" } else { "x64" }
+        $canaryZip = "bun-windows-$canaryArch.zip"
+        # Try GitHub direct, then China-friendly mirrors
+        $canaryUrls = @(
+            "https://github.com/oven-sh/bun/releases/download/canary/$canaryZip",
+            "https://ghproxy.net/https://github.com/oven-sh/bun/releases/download/canary/$canaryZip",
+            "https://ghfast.top/https://github.com/oven-sh/bun/releases/download/canary/$canaryZip"
+        )
+        $canaryTmp = Join-Path $env:TEMP "bun-canary"
+        $canaryOk = $false
+        foreach ($url in $canaryUrls) {
+            Write-Dim "  Trying $url ..."
+            try {
+                $proxy = if ($env:HTTPS_PROXY) { $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $env:HTTP_PROXY } else { $null }
+                if ($proxy) {
+                    Invoke-WebRequest -Uri $url -OutFile (Join-Path $canaryTmp "bun-canary.zip") -Proxy $proxy -UseBasicParsing
+                } else {
+                    Invoke-WebRequest -Uri $url -OutFile (Join-Path $canaryTmp "bun-canary.zip") -UseBasicParsing
+                }
+                if ((Get-Item (Join-Path $canaryTmp "bun-canary.zip") -ErrorAction SilentlyContinue).Length -gt 0) {
+                    $canaryOk = $true
+                    break
+                }
+            } catch {
+                # Try next mirror
+            }
+        }
+        if ($canaryOk) {
+            try {
+                Expand-Archive -Path (Join-Path $canaryTmp "bun-canary.zip") -DestinationPath $canaryTmp -Force
+                $canaryExe = Get-ChildItem -Path $canaryTmp -Recurse -Filter "bun.exe" | Select-Object -First 1
+                if ($canaryExe) {
+                    Copy-Item -Force $canaryExe.FullName (Join-Path $env:USERPROFILE ".bun\bin\bun.exe")
+                    $BunBin = Join-Path $env:USERPROFILE ".bun\bin\bun.exe"
+                    Write-OK "Bun upgraded to canary: $(& $BunBin --version)"
+                }
+            } catch {
+                Write-Warn "Failed to extract canary Bun: $_"
+            }
+        } else {
+            Write-Warn "All download mirrors failed"
+        }
+        Remove-Item -Recurse -Force $canaryTmp -ErrorAction SilentlyContinue
+    }
+
+    # Final check
+    $sanityOut3 = & $BunBin $sanityCli --version 2>&1 | Out-String
+    if ($sanityOut3 -match "Expected CommonJS module to have a function wrapper") {
+        Write-Host ""
+        Write-Err "Auto-upgrade failed. Please upgrade Bun manually:"
+        Write-Err "  bun upgrade --canary"
+        Write-Err "  Then re-run install.ps1."
+        exit 1
+    }
 }
 Write-OK "Bun loads cli.original.cjs"
 

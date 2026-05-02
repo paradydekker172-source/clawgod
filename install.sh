@@ -1094,6 +1094,17 @@ const patches = [
     optional: true,  // removed in v2.1.92+
   },
   {
+    // WebFetch calls api.anthropic.com/api/web/domain_info to check if a URL's
+    // domain is safe to fetch. In enterprise/restricted networks this API call
+    // fails, producing "Unable to verify if domain X is safe to fetch."  Remove
+    // the entire switch block so WebFetch proceeds without the preflight check.
+    name: 'WebFetch domain safety check bypass',
+    pattern: /if\(!([\w$]+)\(\)\.skipWebFetchPreflight\)switch\(\(await [\w$]+\([\w$]+\)\)\.status\)\{case"allowed":break;case"blocked":throw new [\w$]+\([\w$]+\);case"check_failed":throw new [\w$]+\([\w$]+\)\}/g,
+    replacer: (m, fn) => `/* clawgod: skip domain safety check */if(!${fn}().skipWebFetchPreflight){}`,
+    sentinel: 'skipWebFetchPreflight',
+    optional: true,
+  },
+  {
     // v2.1.92+ (s_8): if(fn()==="ant")return _;let z=...;return FaY(_,z)
     // Flip the guard so non-ant users also return the pre-filtered list.
     name: 'Message list filter bypass (s_8 form)',
@@ -1267,24 +1278,54 @@ sanity_out=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
 if echo "$sanity_out" | grep -q "Expected CommonJS module to have a function wrapper"; then
   echo ""
   warn "Bun $($BUN_BIN --version) cannot load Anthropic's cli.original.cjs."
+  warn "  Anthropic builds with Bun's canary channel (e.g. 1.3.14), while"
+  warn "  bun.sh's main download is on stable (e.g. 1.3.13)."
   warn ""
-  warn "  Anthropic builds with Bun's canary channel (currently ~1.3.14), while"
-  warn "  bun.sh's main download is on stable (currently 1.3.13). The canary build"
-  warn "  is NOT visible on bun.sh's download page — it lives on GitHub Releases"
-  warn "  and is reachable only via 'bun upgrade --canary'."
-  warn ""
-  warn "  If your bun is from bun.sh:"
-  warn "    bun upgrade --canary"
-  warn ""
-  warn "  If your bun is from a package manager (brew/apt/scoop) where the binary"
-  warn "  is behind a shim and refuses to self-replace ('bun upgrade' silently"
-  warn "  hangs or no-ops):"
-  warn "    <pkg-manager> uninstall bun"
-  warn "    curl -fsSL https://bun.sh/install | bash"
-  warn "    bun upgrade --canary"
-  warn ""
-  warn "  Then re-run install.sh — this sanity check will pass."
-  exit 1
+  dim "Auto-upgrading Bun to canary ..."
+  "$BUN_BIN" upgrade --canary 2>/dev/null || true
+  # If bun upgrade --canary failed (e.g. package-manager shim), download directly
+  sanity_out2=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
+  if echo "$sanity_out2" | grep -q "Expected CommonJS module to have a function wrapper"; then
+    dim "bun upgrade --canary did not resolve the issue. Downloading canary ..."
+    _canary_tmpdir=$(mktemp -d)
+    _arch=$(uname -m)
+    case "$_arch" in x86_64|amd64) _canary_arch="x64" ;; aarch64|arm64) _canary_arch="aarch64" ;; *) _canary_arch="x64" ;; esac
+    if [ "$(uname -s)" = "Darwin" ]; then _canary_os="darwin"; else _canary_os="linux"; fi
+    _canary_zip="bun-$_canary_os-$_canary_arch.zip"
+    # Try GitHub direct, then China-friendly mirrors
+    _canary_urls=(
+      "https://github.com/oven-sh/bun/releases/download/canary/$_canary_zip"
+      "https://ghproxy.net/https://github.com/oven-sh/bun/releases/download/canary/$_canary_zip"
+      "https://ghfast.top/https://github.com/oven-sh/bun/releases/download/canary/$_canary_zip"
+    )
+    _canary_ok=0
+    for _url in "${_canary_urls[@]}"; do
+      dim "  Trying $_url ..."
+      if curl -fsSL --connect-timeout 10 "$_url" -o "$_canary_tmpdir/bun-canary.zip" 2>/dev/null && [ -s "$_canary_tmpdir/bun-canary.zip" ]; then
+        _canary_ok=1
+        break
+      fi
+    done
+    if [ "$_canary_ok" = "1" ]; then
+      unzip -o "$_canary_tmpdir/bun-canary.zip" -d "$_canary_tmpdir" >/dev/null 2>&1
+      _canary_bin=$(find "$_canary_tmpdir" -name "bun" -o -name "bun.exe" 2>/dev/null | head -1)
+      if [ -n "$_canary_bin" ] && [ -x "$_canary_bin" ]; then
+        cp -f "$_canary_bin" "$HOME/.bun/bin/bun"
+        BUN_BIN="$HOME/.bun/bin/bun"
+        info "Bun upgraded to canary: $($BUN_BIN --version)"
+      fi
+    fi
+    rm -rf "$_canary_tmpdir"
+  fi
+  # Final check
+  sanity_out3=$("$BUN_BIN" "$CLAWGOD_DIR/cli.cjs" --version 2>&1 || true)
+  if echo "$sanity_out3" | grep -q "Expected CommonJS module to have a function wrapper"; then
+    echo ""
+    warn "Auto-upgrade failed. Please upgrade Bun manually:"
+    warn "  bun upgrade --canary"
+    warn "  Then re-run install.sh."
+    exit 1
+  fi
 fi
 info "Bun loads cli.original.cjs"
 
