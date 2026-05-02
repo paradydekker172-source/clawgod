@@ -246,7 +246,7 @@ $platformSuffix = "win32-$arch"
 #    already a hard prerequisite for the patcher, so reuse it.
 if (-not $NativeBin) {
     $npmPkg = "@anthropic-ai/claude-code-$platformSuffix"
-    Write-Dim "Fetching $npmPkg@latest from npm registry ..."
+    Write-Dim "Fetching $npmPkg@$verSpec from npm registry ..."
     $NativeBinTmpDir = Join-Path $env:TEMP "clawgod-binary-$([Guid]::NewGuid().ToString('N'))"
     $script:RollbackTmpDir = $NativeBinTmpDir
     New-Item -ItemType Directory -Force -Path $NativeBinTmpDir | Out-Null
@@ -309,7 +309,8 @@ console.log(`Extracted ${files} files`);
 console.log(`VERSION=${meta.version}`);
 '@ | Set-Content $fetchScript -Encoding UTF8
 
-    $output = & node $fetchScript "$npmPkg@latest" $NativeBinTmpDir 2>&1
+    $verSpec = if ($Version -ne "latest") { $Version } else { "latest" }
+    $output = & node $fetchScript "$npmPkg@$verSpec" $NativeBinTmpDir 2>&1
     $exitCode = $LASTEXITCODE
     $output | ForEach-Object { Write-Host "  $_" }
     Remove-Item -Force $fetchScript -ErrorAction SilentlyContinue
