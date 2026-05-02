@@ -740,7 +740,7 @@ function extractCliJs(buf) {
   return buf.slice(fnStart, ending + CLI_END_MARKER.length).toString('utf8');
 }
 
-function main() {
+async function main() {
   const [, , binaryPath, outputDir, ...rest] = process.argv;
   const wantCliJs = rest.includes('--cli-js');
   const wantExtractBun = rest.includes('--extract-bun');
@@ -849,7 +849,7 @@ function main() {
   }
 }
 
-main();
+main().catch(e => { console.error(e); process.exit(1); });
 '@ | Set-Content $extractorPath -Encoding UTF8
 Push-RollbackFile $extractorPath
 

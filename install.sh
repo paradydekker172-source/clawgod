@@ -700,7 +700,7 @@ function extractBunRuntime(buf, format) {
   return { buf: null, info: null };
 }
 
-function main() {
+async function main() {
   const [, , binaryPath, outputDir, ...rest] = process.argv;
   const wantCliJs = rest.includes('--cli-js');
   const wantExtractBun = rest.includes('--extract-bun');
@@ -809,7 +809,7 @@ function main() {
   }
 }
 
-main();
+main().catch(e => { console.error(e); process.exit(1); });
 EXTRACTOR_EOF
 _rollback_push_file "$CLAWGOD_DIR/extract-natives.mjs"
 
