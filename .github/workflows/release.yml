@@ -68,12 +68,24 @@ jobs:
             echo
             echo '**macOS / Linux:**'
             echo '```bash'
-            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash"
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash && hash -r"
             echo '```'
             echo
             echo '**Windows (PowerShell):**'
             echo '```powershell'
-            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex"
+            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex; hash -r"
+            echo '```'
+            echo
+            echo "## Uninstall"
+            echo
+            echo '**macOS / Linux:**'
+            echo '```bash'
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash -s -- --uninstall && hash -r"
+            echo '```'
+            echo
+            echo '**Windows (PowerShell):**'
+            echo '```powershell'
+            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex -Args '--uninstall'; hash -r"
             echo '```'
             if [ -n "$prev" ]; then
               echo
