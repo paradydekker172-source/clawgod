@@ -85,7 +85,7 @@ jobs:
             echo
             echo '**Windows (PowerShell):**'
             echo '```powershell'
-            echo "& ($env:USERPROFILE + '\\.clawgod\\install.ps1') -Uninstall"
+            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 -OutFile \`$env:TEMP\\clawgod-install.ps1; & \`$env:TEMP\\clawgod-install.ps1 -Uninstall"
             echo '```'
             echo
             echo '> After install/uninstall, restart your terminal or run `hash -r` (bash/zsh) to refresh the command cache.'
