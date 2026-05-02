@@ -68,25 +68,27 @@ jobs:
             echo
             echo '**macOS / Linux:**'
             echo '```bash'
-            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash && hash -r"
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash"
             echo '```'
             echo
             echo '**Windows (PowerShell):**'
             echo '```powershell'
-            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex; hash -r"
+            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex"
             echo '```'
             echo
             echo "## Uninstall"
             echo
             echo '**macOS / Linux:**'
             echo '```bash'
-            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash -s -- --uninstall && hash -r"
+            echo "curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash -s -- --uninstall"
             echo '```'
             echo
             echo '**Windows (PowerShell):**'
             echo '```powershell'
-            echo "irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex -Args '--uninstall'; hash -r"
+            echo "& ($env:USERPROFILE + '\\.clawgod\\install.ps1') -Uninstall"
             echo '```'
+            echo
+            echo '> After install/uninstall, restart your terminal or run `hash -r` (bash/zsh) to refresh the command cache.'
             if [ -n "$prev" ]; then
               echo
               echo "**Full changelog:** https://github.com/${{ github.repository }}/compare/${prev}...${tag}"
