@@ -63,19 +63,7 @@ if [ "$UNINSTALL" = "1" ]; then
     fi
   done
 
-  # Restore npm-installed claude if we replaced it
-  if command -v npm &>/dev/null; then
-    NPM_PREFIX=$(npm config get prefix 2>/dev/null || true)
-    for _npm_candidate in "$NPM_PREFIX" "$HOME/.npm-global" "/usr/local"; do
-      [ -z "$_npm_candidate" ] && continue
-      _npm_claude="$_npm_candidate/bin/claude"
-      _npm_orig="$_npm_claude.orig"
-      if [ -f "$_npm_orig" ]; then
-        mv -f "$_npm_orig" "$_npm_claude"
-        info "Restored npm claude ($_npm_candidate/bin)"
-      fi
-    done
-  fi
+  # No npm file restoration needed — we never replaced them (PATH precedence only)
 
   rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/vendor" "$CLAWGOD_DIR/bun-runtime" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.original.cjs" "$CLAWGOD_DIR/cli.original.cjs.bak" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/cli.cjs" "$CLAWGOD_DIR/patch.mjs" "$CLAWGOD_DIR/patch.js" "$CLAWGOD_DIR/extract-natives.mjs" "$CLAWGOD_DIR/post-process.mjs" "$CLAWGOD_DIR/repatch.mjs" "$CLAWGOD_DIR/.source-version" "$CLAWGOD_DIR/features.json" "$CLAWGOD_DIR/provider.json" "$CLAWGOD_DIR/install.sh" "$CLAWGOD_DIR/install.ps1"
   # Remove .clawgod directory itself if empty
@@ -1438,54 +1426,65 @@ fi
 write_launcher "$BIN_DIR/clawgod"
 info "Command 'clawgod' → patched ($BIN_DIR/clawgod)"
 
-# ─── Handle npm-installed claude (PATH shadowing) ──────────────
-# npm installs claude in a global bin dir (e.g. /usr/local/bin or
-# $NPM_CONFIG_PREFIX/bin) which may come BEFORE ~/.local/bin in PATH.
-# Back up and replace those too so `claude` always runs clawgod.
 
-NPM_GLOBAL_DIR=""
-if command -v npm &>/dev/null; then
-  NPM_GLOBAL_DIR=$(npm config get prefix 2>/dev/null || true)
-  # Strip trailing /bin — npm prefix sometimes includes it on Windows/MSYS2
-  NPM_GLOBAL_DIR="${NPM_GLOBAL_DIR%/bin}"
-  if [ -n "$NPM_GLOBAL_DIR" ] && [ ! -d "$NPM_GLOBAL_DIR" ]; then
-    NPM_GLOBAL_DIR=""
-  fi
-fi
-# Also check common npm global locations
-for _npm_candidate in "$NPM_GLOBAL_DIR" "$HOME/.npm-global" "/usr/local"; do
-  [ -z "$_npm_candidate" ] && continue
-  _npm_claude="$_npm_candidate/bin/claude"
-  # Skip if it's the same file we already replaced
-  if [ "$_npm_claude" = "$CLAUDE_BIN" ] || [ "$_npm_claude" = "$BIN_DIR/claude" ]; then
-    continue
-  fi
-  if [ -f "$_npm_claude" ] && ! grep -q "clawgod" "$_npm_claude" 2>/dev/null; then
-    # Back up original
-    if [ ! -e "$_npm_claude.orig" ]; then
-      cp "$_npm_claude" "$_npm_claude.orig"
-      info "Backed up npm claude → claude.orig ($_npm_candidate/bin)"
-    fi
-    # Replace with our launcher
-    write_launcher "$_npm_claude"
-    info "Replaced npm claude → clawgod launcher ($_npm_candidate/bin)"
-  fi
-done
+# ─── Ensure ~/.local/bin is in PATH and before npm's global bin ────────
+# We no longer replace npm's claude files — instead we guarantee that
+# ~/.local/bin appears before any npm global bin in PATH, so our launcher
+# takes priority. This is less fragile than file replacement (no backup
+# state to manage, no stale restores on uninstall).
 
-# ─── Check PATH ───────────────────────────────────────
-
-if ! echo "$PATH" | grep -q "$CLAUDE_DIR" && ! echo "$PATH" | grep -q "$BIN_DIR"; then
-  # Detect shell config file
-  case "$(basename "$SHELL")" in
-    zsh)  SHELL_RC="$HOME/.zshrc" ;;
-    bash) SHELL_RC="$HOME/.bashrc" ;;
-    fish) SHELL_RC="$HOME/.config/fish/config.fish" ;;
-    *)    SHELL_RC="$HOME/.profile" ;;
+_ensure_path_precedence() {
+  # Determine shell config file
+  case "$(basename "$SHELL")"
+    in zsh)  _rc="$HOME/.zshrc" ;;
+       bash) _rc="$HOME/.bashrc" ;;
+       fish) _rc="$HOME/.config/fish/config.fish" ;;
+       *)    _rc="$HOME/.profile" ;;
   esac
-  echo ""
-  warn "$BIN_DIR is not in PATH. Run:"
-  dim "  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> $SHELL_RC && source $SHELL_RC"
-fi
+
+  # Find npm's global bin dir (if any)
+  _npm_bindir=""
+  if command -v npm &>/dev/null; then
+    _npm_prefix=$(npm config get prefix 2>/dev/null || true)
+    _npm_prefix="${_npm_prefix%/bin}"
+    if [ -n "$_npm_prefix" ] && [ -d "$_npm_prefix/bin" ]; then
+      _npm_bindir="$_npm_prefix/bin"
+    fi
+  fi
+
+  # Check if BIN_DIR is already in PATH
+  if echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
+    # BIN_DIR is in PATH — verify it comes before npm's bin dir
+    if [ -n "$_npm_bindir" ] && echo ":$PATH:" | grep -q ":$_npm_bindir:"; then
+      _bin_idx=$(echo ":$PATH:" | tr ':' '\n' | grep -nxF "$BIN_DIR" | head -1 | cut -d: -f1)
+      _npm_idx=$(echo ":$PATH:" | tr ':' '\n' | grep -nxF "$_npm_bindir" | head -1 | cut -d: -f1)
+      if [ -n "$_npm_idx" ] && [ -n "$_bin_idx" ] && [ "$_npm_idx" -lt "$_bin_idx" ]; then
+        # npm dir comes first — need to reorder by prepending BIN_DIR
+        export PATH="$BIN_DIR:$PATH"
+        # Persist the reorder
+        if ! grep -q "export PATH=\"\$HOME/.local/bin:\$PATH\"" "$_rc" 2>/dev/null; then
+          printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$_rc"
+        fi
+        info "Moved $BIN_DIR before npm in PATH"
+      fi
+    fi
+    return
+  fi
+
+  # BIN_DIR not in PATH at all — add it
+  export PATH="$BIN_DIR:$PATH"
+  case "$(basename "$SHELL")" in
+    fish) _path_line="set -gx PATH $BIN_DIR \$PATH" ;;
+    *)    _path_line='export PATH="$HOME/.local/bin:$PATH"' ;;
+  esac
+  if ! grep -q "$_path_line" "$_rc" 2>/dev/null; then
+    printf '\n%s\n' "$_path_line" >> "$_rc"
+  fi
+  info "Added $BIN_DIR to PATH (front)"
+  dim "  Run: source $_rc  (or restart terminal)"
+}
+
+_ensure_path_precedence
 
 # ─── Flush shell cache ────────────────────────────────
 

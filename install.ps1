@@ -62,26 +62,18 @@ if ($Uninstall) {
         Write-OK "Removed clawgod alias"
     }
 
-    # Restore npm-installed claude if we replaced it
-    $npmDir = Join-Path $env:APPDATA "npm"
-    $npmClaudeCmd = Join-Path $npmDir "claude.cmd"
-    $npmOrigCmd   = Join-Path $npmDir "claude.orig.cmd"
-    if ((Test-Path $npmOrigCmd)) {
-        Move-Item -Force $npmOrigCmd $npmClaudeCmd -ErrorAction SilentlyContinue
-        Write-OK "Restored npm claude.cmd"
+    # Remove App Paths registry entries
+    foreach ($appKey in @(
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\claude.exe",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\clawgod.exe"
+    )) {
+        if (Test-Path $appKey) {
+            Remove-Item -Path $appKey -Force -Recurse -ErrorAction SilentlyContinue
+        }
     }
-    $npmClaudePs1 = Join-Path $npmDir "claude.ps1"
-    $npmOrigPs1   = Join-Path $npmDir "claude.orig.ps1"
-    if ((Test-Path $npmOrigPs1)) {
-        Move-Item -Force $npmOrigPs1 $npmClaudePs1 -ErrorAction SilentlyContinue
-        Write-OK "Restored npm claude.ps1"
-    }
-    $npmClaudeSh = Join-Path $npmDir "claude"
-    $npmOrigSh   = Join-Path $npmDir "claude.orig"
-    if ((Test-Path $npmOrigSh)) {
-        Move-Item -Force $npmOrigSh $npmClaudeSh -ErrorAction SilentlyContinue
-        Write-OK "Restored npm claude (shell)"
-    }
+    Write-OK "Removed App Paths registry entries"
+
+    # No npm file restoration needed — we never replaced them (PATH precedence only)
 
     foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime","vendor","features.json","provider.json","install.sh","install.ps1")) {
         $p = Join-Path $ClawDir $f
@@ -1385,53 +1377,41 @@ foreach ($cmd in @("claude", "clawgod")) {
 }
 Write-OK "Commands 'claude' + 'clawgod' → patched"
 
-# ─── Handle npm-installed claude (PATH shadowing) ──────────────
-# npm installs claude.cmd / claude.ps1 in AppData/Roaming/npm which
-# may come BEFORE ~/.local/bin in PATH, shadowing our launcher.
-# Back up and replace those too so `claude` always runs clawgod.
+# ─── Ensure BinDir is in PATH and before npm's global bin ──────────────
+# We no longer replace npm's claude files — instead we guarantee that
+# ~/.local/bin appears before AppData/Roaming/npm in PATH, so our launcher
+# takes priority. This is less fragile than file replacement (no backup
+# state to manage, no stale restores on uninstall).
+#
+# Additionally, register an App Paths entry for 'claude.exe' in the
+# registry. Windows uses App Paths to resolve commands from Win+R, Start
+# menu, and some shells — this provides a fallback even if PATH order is
+# wrong. The .cmd launcher in BinDir is still the primary mechanism.
+
+# Register App Paths for claude.exe
+$appPathsKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\claude.exe"
+try {
+    if (-not (Test-Path $appPathsKey)) {
+        New-Item -Path $appPathsKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $appPathsKey -Name "(Default)" -Value (Join-Path $BinDir "claude.cmd") -Force
+    Set-ItemProperty -Path $appPathsKey -Name "Path" -Value $BinDir -Force
+    Write-OK "Registered App Paths: claude.exe → $BinDir"
+} catch {
+    Write-Warn "Could not register App Paths (non-fatal): $_"
+}
+
+# Also register for clawgod.exe
+$clawgodAppKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\clawgod.exe"
+try {
+    if (-not (Test-Path $clawgodAppKey)) {
+        New-Item -Path $clawgodAppKey -Force | Out-Null
+    }
+    Set-ItemProperty -Path $clawgodAppKey -Name "(Default)" -Value (Join-Path $BinDir "clawgod.cmd") -Force
+    Set-ItemProperty -Path $clawgodAppKey -Name "Path" -Value $BinDir -Force
+} catch {}
 
 $npmDir = Join-Path $env:APPDATA "npm"
-$npmClaudeCmd  = Join-Path $npmDir "claude.cmd"
-$npmClaudePs1  = Join-Path $npmDir "claude.ps1"
-$npmClaudeSh   = Join-Path $npmDir "claude"
-$npmOrigCmd    = Join-Path $npmDir "claude.orig.cmd"
-$npmOrigPs1    = Join-Path $npmDir "claude.orig.ps1"
-$npmOrigSh     = Join-Path $npmDir "claude.orig"
-
-if (Test-Path $npmClaudeCmd) {
-    # Back up original npm claude.cmd if not already backed up
-    if (-not (Test-Path $npmOrigCmd)) {
-        Copy-Item $npmClaudeCmd $npmOrigCmd -Force
-        Write-OK "Backed up npm claude.cmd → claude.orig.cmd"
-    }
-    # Replace with clawgod launcher
-    $launcherContent | Set-Content $npmClaudeCmd -Encoding ASCII
-    Write-OK "Replaced npm claude.cmd → clawgod launcher"
-}
-
-if (Test-Path $npmClaudePs1) {
-    if (-not (Test-Path $npmOrigPs1)) {
-        Copy-Item $npmClaudePs1 $npmOrigPs1 -Force
-        Write-OK "Backed up npm claude.ps1 → claude.orig.ps1"
-    }
-    # Write a PowerShell launcher that calls bun directly
-    $ps1Content = "#!/usr/bin/env pwsh`r`n& `"$bunPath`" `"$cliPath`" @args"
-    $ps1Content | Set-Content $npmClaudePs1 -Encoding UTF8
-    Write-OK "Replaced npm claude.ps1 → clawgod launcher"
-}
-
-if (Test-Path $npmClaudeSh) {
-    if (-not (Test-Path $npmOrigSh)) {
-        Copy-Item $npmClaudeSh $npmOrigSh -Force
-        Write-OK "Backed up npm claude (shell) → claude.orig"
-    }
-    $shContent = "#!/bin/sh`nexec `"$($BunBin -replace '\\','/')`" `"$($cliPath -replace '\\','/')`" `"$@`""
-    [System.IO.File]::WriteAllText($npmClaudeSh, $shContent)
-    Write-OK "Replaced npm claude (shell) → clawgod launcher"
-}
-
-# ─── Ensure BinDir is in PATH (before npm dir) ─────────────────
-
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
 $pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
 $binInPath = $pathParts | Where-Object { $_ -ieq $BinDir }
