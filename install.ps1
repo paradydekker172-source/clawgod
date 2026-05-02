@@ -38,12 +38,15 @@ Write-Host ""
 # ─── Uninstall ────────────────────────────────────────
 
 if ($Uninstall) {
-    # Restore original claude
+    # Restore original claude or remove clawgod launcher
     $claudeOrig = Join-Path $BinDir "claude.orig.cmd"
     $claudeCmd  = Join-Path $BinDir "claude.cmd"
     if (Test-Path $claudeOrig) {
         Move-Item -Force $claudeOrig $claudeCmd
         Write-OK "Original claude restored"
+    } elseif ((Test-Path $claudeCmd) -and (Get-Content $claudeCmd -Raw).Contains("clawgod")) {
+        Remove-Item -Force $claudeCmd
+        Write-OK "Removed ClawGod launcher (claude.cmd)"
     }
     # Also check for .exe backup
     $claudeExeOrig = Join-Path $BinDir "claude.orig.exe"
@@ -59,9 +62,14 @@ if ($Uninstall) {
         Write-OK "Removed clawgod alias"
     }
 
-    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime")) {
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime","vendor","features.json","provider.json","install.sh","install.ps1")) {
         $p = Join-Path $ClawDir $f
         if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+    }
+    # Remove .clawgod directory itself if empty
+    if ((Get-ChildItem $ClawDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+        Remove-Item -Force $ClawDir
+        Write-OK "Removed ~/.clawgod directory"
     }
     Write-OK "ClawGod uninstalled"
     Write-Host ""
