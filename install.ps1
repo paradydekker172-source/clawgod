@@ -14,8 +14,7 @@
 #>
 param(
     [string]$Version = "latest",
-    [switch]$Uninstall,
-    [switch]$DryRun
+    [switch]$Uninstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,20 +22,54 @@ $ErrorActionPreference = "Stop"
 $ClawDir = Join-Path $env:USERPROFILE ".clawgod"
 $BinDir  = Join-Path $env:USERPROFILE ".local\bin"
 
+# ─── BOM-free UTF-8 writer ─────────────────────────────
+# PS 5.1's Set-Content -Encoding UTF8 writes a BOM, which breaks .mjs files.
+# This helper writes UTF-8 without BOM on all PS versions.
+# Supports both pipeline input and -Content parameter.
+function Write-Utf8NoBom {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(ParameterSetName='Direct', Position=1)][string]$Content,
+        [Parameter(ParameterSetName='Pipeline', ValueFromPipeline=$true)][string]$InputObject
+    )
+    begin { $sb = [System.Text.StringBuilder]::new() }
+    process {
+        if ($PSCmdlet.ParameterSetName -eq 'Pipeline') {
+            [void]$sb.AppendLine($InputObject)
+        }
+    }
+    end {
+        $text = if ($PSCmdlet.ParameterSetName -eq 'Pipeline') { $sb.ToString() } else { $Content }
+        $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+        [System.IO.File]::WriteAllText($Path, $text, $utf8NoBom)
+    }
+}
+
 # ─── Transactional state ────────────────────────────────
-# Track what we create/modify so we can roll back on failure.
+# Track what we create/modify so we can clean up on failure or uninstall.
 
 $script:RollbackFiles = [System.Collections.Generic.List[string]]::new()
 $script:RollbackRestores = [System.Collections.Generic.List[Tuple[string,string]]]::new()
 $script:RollbackRmdirs = [System.Collections.Generic.List[string]]::new()
+$script:RollbackRegKeys = [System.Collections.Generic.List[string]]::new()
 $script:RollbackTmpDir = $null
+$script:RollbackPathAdded = $false
+$script:OriginalUserPath = $null
 
 function Push-RollbackFile { param([string]$Path) $script:RollbackFiles.Add($Path) }
 function Push-RollbackRestore { param([string]$Src, [string]$Dst) $script:RollbackRestores.Add([Tuple[string,string]]::new($Src, $Dst)) }
 function Push-RollbackRmdir { param([string]$Path) $script:RollbackRmdirs.Add($Path) }
+function Push-RollbackRegKey { param([string]$Key) $script:RollbackRegKeys.Add($Key) }
 
-function Invoke-Rollback {
-    Write-Host "  Install failed. Rolling back ..." -ForegroundColor Red
+function Invoke-Cleanup {
+    param([ValidateSet("Rollback","Uninstall")][string]$Mode = "Rollback")
+
+    if ($Mode -eq "Rollback") {
+        Write-Host "  Install failed. Rolling back ..." -ForegroundColor Red
+    } else {
+        Write-Host "  Uninstalling ..." -ForegroundColor DarkGray
+    }
+
     # Restore backed-up files
     foreach ($pair in $script:RollbackRestores) {
         if (Test-Path $pair.Item1) {
@@ -55,17 +88,86 @@ function Invoke-Rollback {
             try { if (-not (Get-ChildItem $d -Force -ErrorAction SilentlyContinue)) { Remove-Item -Force $d } } catch {}
         }
     }
-    # Clean temp dir
-    if ($script:RollbackTmpDir -and (Test-Path $script:RollbackTmpDir)) {
+
+    # ── Uninstall-only steps ──
+    if ($Mode -eq "Uninstall") {
+        # Remove App Paths registry entries
+        foreach ($appKey in $script:RollbackRegKeys) {
+            if (Test-Path $appKey) {
+                try { Remove-Item -Path $appKey -Force -Recurse -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+        # Also clean any App Paths we might have missed
+        foreach ($appKey in @(
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\claude.exe",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\clawgod.exe"
+        )) {
+            if (Test-Path $appKey) {
+                try { Remove-Item -Path $appKey -Force -Recurse -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+        Write-OK "Removed App Paths registry entries"
+
+        # Remove PATH entry we added during install
+        if ($script:RollbackPathAdded -or $script:OriginalUserPath) {
+            $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            $pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
+            $newParts = $pathParts | Where-Object { $_ -ine $BinDir }
+            if ($newParts.Count -ne $pathParts.Count) {
+                [Environment]::SetEnvironmentVariable("Path", ($newParts -join ";"), "User")
+                Write-OK "Removed $BinDir from user PATH"
+            }
+        }
+
+        # Clean up stale claude launchers in npm's global bin dir
+        $npmDir = Join-Path $env:APPDATA "npm"
+        foreach ($stem in @("claude", "claude.cmd", "claude.ps1")) {
+            $npmFile = Join-Path $npmDir $stem
+            $npmOrig = Join-Path $npmDir ($stem -replace '^(claude)', '$1.orig')
+            if ((Test-Path $npmFile) -and (Get-Content $npmFile -Raw -ErrorAction SilentlyContinue).Contains("clawgod")) {
+                if (Test-Path $npmOrig) {
+                    Move-Item -Force $npmOrig $npmFile -ErrorAction SilentlyContinue
+                    Write-OK "Restored original npm launcher ($npmFile)"
+                } else {
+                    Remove-Item -Force $npmFile
+                    Write-OK "Removed stale npm launcher ($npmFile)"
+                }
+            }
+        }
+        # Clean up leftover .orig files if the main file was already removed
+        foreach ($stem in @("claude.orig", "claude.orig.cmd", "claude.orig.ps1")) {
+            $npmOrig = Join-Path $npmDir $stem
+            if (Test-Path $npmOrig) {
+                $mainStem = $stem -replace '\.orig', ''
+                $npmMain = Join-Path $npmDir $mainStem
+                if (-not (Test-Path $npmMain)) {
+                    Move-Item -Force $npmOrig $npmMain -ErrorAction SilentlyContinue
+                    Write-OK "Restored original npm launcher ($npmMain)"
+                }
+            }
+        }
+
+        # Remove .clawgod entirely (even if non-empty — user asked to uninstall)
+        if (Test-Path $ClawDir) {
+            Remove-Item -Recurse -Force $ClawDir -ErrorAction SilentlyContinue
+            Write-OK "Removed $ClawDir"
+        }
+    }
+
+    # Clean temp dir (rollback only — gone by uninstall time)
+    if ($Mode -eq "Rollback" -and $script:RollbackTmpDir -and (Test-Path $script:RollbackTmpDir)) {
         Remove-Item -Recurse -Force $script:RollbackTmpDir -ErrorAction SilentlyContinue
     }
-    Write-Host "  Rollback complete. System restored to pre-install state." -ForegroundColor Red
+
+    if ($Mode -eq "Rollback") {
+        Write-Host "  Rollback complete. System restored to pre-install state." -ForegroundColor Red
+    }
 }
 
 $script:InstallSucceeded = $false
 
 trap {
-    if (-not $script:InstallSucceeded) { Invoke-Rollback }
+    if (-not $script:InstallSucceeded) { Invoke-Cleanup -Mode Rollback }
     break
 }
 
@@ -84,84 +186,43 @@ Write-Host ""
 # ─── Uninstall ────────────────────────────────────────
 
 if ($Uninstall) {
-    # Restore original claude or remove clawgod launcher in BinDir
-    $claudeOrig = Join-Path $BinDir "claude.orig.cmd"
-    $claudeCmd  = Join-Path $BinDir "claude.cmd"
-    if (Test-Path $claudeOrig) {
-        Move-Item -Force $claudeOrig $claudeCmd
-        Write-OK "Original claude restored"
-    } elseif ((Test-Path $claudeCmd) -and (Get-Content $claudeCmd -Raw).Contains("clawgod")) {
-        Remove-Item -Force $claudeCmd
-        Write-OK "Removed ClawGod launcher (claude.cmd)"
-    }
-    # Also check for .exe backup
-    $claudeExeOrig = Join-Path $BinDir "claude.orig.exe"
+    # Populate rollback tracking from current filesystem state,
+    # then delegate to Invoke-Cleanup -Mode Uninstall.
+
+    # Restore pairs: .orig -> original
+    $claudeOrigCmd = Join-Path $BinDir "claude.orig.cmd"
+    $claudeCmd     = Join-Path $BinDir "claude.cmd"
+    if (Test-Path $claudeOrigCmd) { Push-RollbackRestore $claudeOrigCmd $claudeCmd }
+    $claudeOrigExe = Join-Path $BinDir "claude.orig.exe"
     $claudeExe     = Join-Path $BinDir "claude.exe"
-    if (Test-Path $claudeExeOrig) {
-        Move-Item -Force $claudeExeOrig $claudeExe
-        Write-OK "Original claude.exe restored"
-    }
-    # Remove explicit clawgod alias
+    if (Test-Path $claudeOrigExe) { Push-RollbackRestore $claudeOrigExe $claudeExe }
+
+    # Track clawgod launchers for removal (skip if already in restores)
     $clawgodCmd = Join-Path $BinDir "clawgod.cmd"
-    if (Test-Path $clawgodCmd) {
-        Remove-Item -Force $clawgodCmd
-        Write-OK "Removed clawgod alias"
+    if (Test-Path $clawgodCmd) { Push-RollbackFile $clawgodCmd }
+    if ((Test-Path $claudeCmd) -and -not (Test-Path $claudeOrigCmd) -and (Get-Content $claudeCmd -Raw -ErrorAction SilentlyContinue).Contains("clawgod")) {
+        Push-RollbackFile $claudeCmd
     }
 
-    # Remove App Paths registry entries
-    foreach ($appKey in @(
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\claude.exe",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\clawgod.exe"
-    )) {
-        if (Test-Path $appKey) {
-            Remove-Item -Path $appKey -Force -Recurse -ErrorAction SilentlyContinue
-        }
-    }
-    Write-OK "Removed App Paths registry entries"
-
-    # Clean up stale claude launchers in npm's global bin dir.
-    # The installer relies on PATH precedence (.local\bin before npm) — after
-    # uninstall, our launcher is gone but npm's claude.cmd may still reference
-    # the deleted .clawgod\cli.cjs, leaving a broken command.
-    # If npm dir has .orig backups, restore them; otherwise remove clawgod refs.
-    $npmDir = Join-Path $env:APPDATA "npm"
-    foreach ($stem in @("claude", "claude.cmd", "claude.ps1")) {
-        $npmFile = Join-Path $npmDir $stem
-        $npmOrig = Join-Path $npmDir ($stem -replace '^(claude)', '$1.orig')
-        if ((Test-Path $npmFile) -and (Get-Content $npmFile -Raw -ErrorAction SilentlyContinue).Contains("clawgod")) {
-            if (Test-Path $npmOrig) {
-                Move-Item -Force $npmOrig $npmFile
-                Write-OK "Restored original npm launcher ($npmFile)"
-            } else {
-                Remove-Item -Force $npmFile
-                Write-OK "Removed stale npm launcher ($npmFile)"
-            }
-        }
-    }
-    # Clean up leftover .orig files if the main file was already removed
-    foreach ($stem in @("claude.orig", "claude.orig.cmd", "claude.orig.ps1")) {
-        $npmOrig = Join-Path $npmDir $stem
-        if (Test-Path $npmOrig) {
-            $mainStem = $stem -replace '\.orig', ''
-            $npmMain = Join-Path $npmDir $mainStem
-            if (-not (Test-Path $npmMain)) {
-                Move-Item -Force $npmOrig $npmMain
-                Write-OK "Restored original npm launcher ($npmMain)"
-            }
-        }
-    }
-
-    # No npm file restoration needed — we never replaced them (PATH precedence only)
-
-    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime","vendor","features.json","provider.json","install.sh","install.ps1")) {
+    # Track .clawgod files for removal
+    foreach ($f in @("cli.js","cli.cjs","cli.original.js","cli.original.cjs","cli.original.js.bak","cli.original.cjs.bak","patch.js","patch.mjs","extract-natives.mjs","post-process.mjs","repatch.mjs",".source-version","node_modules","bun-runtime","vendor","features.json","provider.json")) {
         $p = Join-Path $ClawDir $f
-        if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+        if (Test-Path $p) { Push-RollbackFile $p }
     }
-    # Remove .clawgod directory itself if empty
-    if ((Get-ChildItem $ClawDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
-        Remove-Item -Force $ClawDir
-        Write-OK "Removed ~/.clawgod directory"
-    }
+    if (Test-Path $ClawDir) { Push-RollbackRmdir $ClawDir }
+    if (Test-Path $BinDir)  { Push-RollbackRmdir $BinDir }
+
+    # Signal that PATH was modified (so cleanup removes it)
+    $script:RollbackPathAdded = $true
+
+    # Track App Paths registry keys
+    Push-RollbackRegKey "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\claude.exe"
+    Push-RollbackRegKey "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\clawgod.exe"
+
+    # Disable trap so rollback doesn't fire on exit
+    trap { }
+
+    Invoke-Cleanup -Mode Uninstall
     Write-OK "ClawGod uninstalled"
     Write-Host ""
     exit 0
@@ -246,6 +307,7 @@ $platformSuffix = "win32-$arch"
 #    already a hard prerequisite for the patcher, so reuse it.
 if (-not $NativeBin) {
     $npmPkg = "@anthropic-ai/claude-code-$platformSuffix"
+    $verSpec = if ($Version -ne "latest") { $Version } else { "latest" }
     Write-Dim "Fetching $npmPkg@$verSpec from npm registry ..."
     $NativeBinTmpDir = Join-Path $env:TEMP "clawgod-binary-$([Guid]::NewGuid().ToString('N'))"
     $script:RollbackTmpDir = $NativeBinTmpDir
@@ -255,6 +317,7 @@ if (-not $NativeBin) {
 // Download a scoped npm tarball (no npm CLI dependency) and extract it
 // using Node's built-in zlib + a minimal POSIX tar parser.
 import { request as httpsRequest } from 'node:https';
+import { connect as tlsConnect } from 'node:tls';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { gunzipSync } from 'node:zlib';
@@ -264,7 +327,55 @@ const last = pkgSpec.lastIndexOf('@');
 const pkg = last > 0 ? pkgSpec.slice(0, last) : pkgSpec;
 const ver = last > 0 ? pkgSpec.slice(last + 1) : 'latest';
 
+// HTTP proxy support: read HTTP_PROXY / HTTPS_PROXY from environment.
+function parseProxy(url) {
+  try {
+    const u = new URL(url);
+    return { host: u.hostname, port: parseInt(u.port) || (u.protocol === 'https:' ? 443 : 80) };
+  } catch { return null; }
+}
+
 function get(url) {
+  return new Promise((resolve, reject) => {
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+    if (proxyUrl) {
+      // CONNECT tunnel through HTTP proxy
+      const proxy = parseProxy(proxyUrl);
+      if (!proxy) return getDirect(url).then(resolve, reject);
+      const parsed = new URL(url);
+      const req = httpsRequest({
+        host: proxy.host,
+        port: proxy.port,
+        method: 'CONNECT',
+        path: `${parsed.hostname}:443`,
+      });
+      req.on('connect', (res, socket) => {
+        if (res.statusCode !== 200) return reject(new Error(`Proxy CONNECT failed: ${res.statusCode}`));
+        const tlsSocket = tlsConnect({ host: parsed.hostname, servername: parsed.hostname, socket }, () => {
+          const innerReq = httpsRequest({ host: parsed.hostname, path: parsed.pathname + parsed.search, method: 'GET', socket: tlsSocket, agent: false }, (innerRes) => {
+            if (innerRes.statusCode >= 300 && innerRes.statusCode < 400 && innerRes.headers.location) {
+              return get(innerRes.headers.location).then(resolve, reject);
+            }
+            if (innerRes.statusCode !== 200) return reject(new Error(`HTTP ${innerRes.statusCode} for ${url}`));
+            const chunks = [];
+            innerRes.on('data', (c) => chunks.push(c));
+            innerRes.on('end', () => resolve(Buffer.concat(chunks)));
+            innerRes.on('error', reject);
+          });
+          innerReq.on('error', reject);
+          innerReq.end();
+        });
+        tlsSocket.on('error', reject);
+      });
+      req.on('error', reject);
+      req.end();
+    } else {
+      getDirect(url).then(resolve, reject);
+    }
+  });
+}
+
+function getDirect(url) {
   return new Promise((resolve, reject) => {
     httpsRequest(url, { method: 'GET' }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
@@ -307,9 +418,8 @@ while (off + 512 <= buf.length) {
 }
 console.log(`Extracted ${files} files`);
 console.log(`VERSION=${meta.version}`);
-'@ | Set-Content $fetchScript -Encoding UTF8
+'@ | Write-Utf8NoBom -Path $fetchScript
 
-    $verSpec = if ($Version -ne "latest") { $Version } else { "latest" }
     $output = & node $fetchScript "$npmPkg@$verSpec" $NativeBinTmpDir 2>&1
     $exitCode = $LASTEXITCODE
     $output | ForEach-Object { Write-Host "  $_" }
@@ -851,7 +961,7 @@ async function main() {
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
-'@ | Set-Content $extractorPath -Encoding UTF8
+'@ | Write-Utf8NoBom -Path $extractorPath
 Push-RollbackFile $extractorPath
 
 # ─── Extract cli.js + native modules from Bun binary ──────────
@@ -865,6 +975,10 @@ $dstCli = Join-Path $ClawDir "cli.original.js"
 
 Write-Dim "Extracting cli.js from $NativeBinLabel ..."
 & node $extractorPath $NativeBin $ClawDir --cli-js 2>&1 | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Extractor failed (exit $LASTEXITCODE)"
+    exit 1
+}
 if (-not (Test-Path $dstCli)) {
     Write-Err "Failed to extract cli.js from native binary"
     exit 1
@@ -887,6 +1001,9 @@ Push-RollbackRmdir $BunRuntimeDir
 
 Write-Dim "Extracting Bun runtime from native binary ..."
 & node $extractorPath $NativeBin $BunRuntimeDir --extract-bun 2>&1 | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn "Bun extraction failed (exit $LASTEXITCODE), will try fallback"
+}
 
 $BunBin = Join-Path $BunRuntimeDir "bun.exe"
 if (-not (Test-Path $BunBin)) {
@@ -938,9 +1055,13 @@ code = code.replace(/\}\)\s*$/, '})(exports, require, module, __filename, __dirn
 writeFileSync(dst, code);
 unlinkSync(src);
 console.log(`cli.original.cjs: ${code.length} bytes`);
-'@ | Set-Content $postProc -Encoding UTF8
+'@ | Write-Utf8NoBom -Path $postProc
 Push-RollbackFile $postProc
 & node $postProc 2>&1 | ForEach-Object { Write-Host "  $_" }
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Post-process failed (exit $LASTEXITCODE)"
+    exit 1
+}
 if (-not (Test-Path (Join-Path $ClawDir "cli.original.cjs"))) {
     Write-Err "Post-process failed"
     exit 1
@@ -1001,7 +1122,7 @@ run('patcher', [patcher]);
 
 writeFileSync(join(here, '.source-version'), basename(nativeBin) + '\n');
 console.log(`[clawgod] re-patched to ${basename(nativeBin)}`);
-'@ | Set-Content (Join-Path $ClawDir "repatch.mjs") -Encoding UTF8
+'@ | Write-Utf8NoBom -Path (Join-Path $ClawDir "repatch.mjs")
 Push-RollbackFile (Join-Path $ClawDir "repatch.mjs")
 Write-OK "Re-patch helper installed (repatch.mjs)"
 
@@ -1085,14 +1206,13 @@ if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
 }
 
 require('./cli.original.cjs');
-'@ | Set-Content (Join-Path $ClawDir "cli.cjs") -Encoding UTF8
+'@ | Write-Utf8NoBom -Path (Join-Path $ClawDir "cli.cjs")
 Push-RollbackFile (Join-Path $ClawDir "cli.cjs")
+if (Test-Path (Join-Path $ClawDir "provider.json")) { Push-RollbackFile (Join-Path $ClawDir "provider.json") }
 Write-OK "Wrapper created (cli.cjs)"
 
 # ─── Write universal patcher ──────────────────────────
 # (Same Node.js patcher as bash version — extract from install.sh or inline)
-
-$patcherUrl = "https://raw.githubusercontent.com/0Chencc/clawgod/main/patcher.mjs"
 
 # Inline the patcher to avoid extra download
 $patcherCode = @'
@@ -1377,7 +1497,7 @@ if (!dryRun && !verify && applied > 0) {
 console.log(`${'='.repeat(55)}\n`);
 '@
 
-Set-Content (Join-Path $ClawDir "patch.mjs") $patcherCode -Encoding UTF8
+Write-Utf8NoBom -Path (Join-Path $ClawDir "patch.mjs") -Content $patcherCode
 Push-RollbackFile (Join-Path $ClawDir "patch.mjs")
 Write-OK "Patcher created (patch.mjs)"
 
@@ -1385,25 +1505,48 @@ Write-OK "Patcher created (patch.mjs)"
 
 Write-Dim "Applying patches ..."
 node (Join-Path $ClawDir "patch.mjs")
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Patcher failed (exit $LASTEXITCODE)"
+    exit 1
+}
 
 # ─── Create default configs ───────────────────────────
 
 $featuresFile = Join-Path $ClawDir "features.json"
-if (-not (Test-Path $featuresFile)) {
-    @'
-{
-  "tengu_harbor": true,
-  "tengu_session_memory": true,
-  "tengu_amber_flint": true,
-  "tengu_auto_background_agents": true,
-  "tengu_destructive_command_warning": true,
-  "tengu_immediate_model_command": true,
-  "tengu_desktop_upsell": false,
-  "tengu_prompt_cache_1h_config": {"allowlist": ["*"]}
+$defaultFeatures = @{
+    "tengu_harbor" = $true
+    "tengu_session_memory" = $true
+    "tengu_amber_flint" = $true
+    "tengu_auto_background_agents" = $true
+    "tengu_destructive_command_warning" = $true
+    "tengu_immediate_model_command" = $true
+    "tengu_desktop_upsell" = $false
+    "tengu_malort_pedway" = @{"enabled" = $true}
+    "tengu_amber_quartz_disabled" = $false
+    "tengu_prompt_cache_1h_config" = @{"allowlist" = @("*")}
 }
-'@ | Set-Content $featuresFile -Encoding UTF8
+if (-not (Test-Path $featuresFile)) {
+    $defaultFeatures | ConvertTo-Json -Depth 5 | Write-Utf8NoBom -Path $featuresFile
     Push-RollbackFile $featuresFile
     Write-OK "Default features.json created"
+} else {
+    # Merge new keys into existing features.json on re-install
+    try {
+        $existing = Get-Content $featuresFile -Raw | ConvertFrom-Json
+        $modified = $false
+        foreach ($key in $defaultFeatures.Keys) {
+            if (-not ($existing.PSObject.Properties.Name -contains $key)) {
+                $existing | Add-Member -NotePropertyName $key -NotePropertyValue $defaultFeatures[$key]
+                $modified = $true
+            }
+        }
+        if ($modified) {
+            $existing | ConvertTo-Json -Depth 5 | Write-Utf8NoBom -Path $featuresFile
+            Write-OK "Updated features.json with new keys"
+        }
+    } catch {
+        Write-Warn "Could not merge features.json: $_"
+    }
 }
 
 # ─── Verify extracted Bun loads cli.cjs ──────────────────
@@ -1451,8 +1594,8 @@ foreach ($loc in @(
             Write-OK "Original claude.exe backed up → claude.orig.exe"
             $originalFound = $true
         }
-        # Back up .cmd if exists and not already backed up
-        if ($loc -like "*.cmd" -and -not (Test-Path $claudeOrigCmd)) {
+        # Back up .cmd if exists and not already backed up AND not already ours
+        if ($loc -like "*.cmd" -and -not (Test-Path $claudeOrigCmd) -and -not ((Get-Content $loc -Raw -ErrorAction SilentlyContinue).Contains("clawgod"))) {
             Copy-Item $loc $claudeOrigCmd -Force
             Push-RollbackRestore $claudeOrigCmd $loc
             Write-OK "Original claude.cmd backed up → claude.orig.cmd"
@@ -1500,8 +1643,17 @@ if (Test-Path $claudeExe) {
 # Write .cmd launcher for both 'claude' and the explicit 'clawgod' alias.
 foreach ($cmd in @("claude", "clawgod")) {
     $launcherPath = Join-Path $BinDir "$cmd.cmd"
-    $launcherContent | Set-Content $launcherPath -Encoding ASCII
-    Push-RollbackFile $launcherPath
+    # Atomic write: temp file then move
+    $tmpFile = "$launcherPath.tmp.$PID"
+    $launcherContent | Set-Content $tmpFile -Encoding ASCII
+    Move-Item -Force $tmpFile $launcherPath
+    # Only track for removal if no restore entry already covers this path.
+    # Otherwise rollback would: restore .orig → target, then rm target —
+    # destroying the file we just restored.
+    $alreadyCovered = $script:RollbackRestores | Where-Object { $_.Item2 -eq $launcherPath }
+    if (-not $alreadyCovered) {
+        Push-RollbackFile $launcherPath
+    }
 }
 Write-OK "Commands 'claude' + 'clawgod' → patched"
 
@@ -1524,6 +1676,7 @@ try {
     }
     Set-ItemProperty -Path $appPathsKey -Name "(Default)" -Value (Join-Path $BinDir "claude.cmd") -Force
     Set-ItemProperty -Path $appPathsKey -Name "Path" -Value $BinDir -Force
+    Push-RollbackRegKey $appPathsKey
     Write-OK "Registered App Paths: claude.exe → $BinDir"
 } catch {
     Write-Warn "Could not register App Paths (non-fatal): $_"
@@ -1537,6 +1690,7 @@ try {
     }
     Set-ItemProperty -Path $clawgodAppKey -Name "(Default)" -Value (Join-Path $BinDir "clawgod.cmd") -Force
     Set-ItemProperty -Path $clawgodAppKey -Name "Path" -Value $BinDir -Force
+    Push-RollbackRegKey $clawgodAppKey
 } catch {}
 
 $npmDir = Join-Path $env:APPDATA "npm"
@@ -1545,8 +1699,10 @@ $pathParts = $userPath -split ";" | Where-Object { $_ -ne "" }
 $binInPath = $pathParts | Where-Object { $_ -ieq $BinDir }
 if (-not $binInPath) {
     # Insert BinDir at the very front so it takes priority over npm
+    $script:OriginalUserPath = $userPath
     [Environment]::SetEnvironmentVariable("Path", "$BinDir;$userPath", "User")
     $env:Path = "$BinDir;$env:Path"
+    $script:RollbackPathAdded = $true
     Write-OK "Added $BinDir to user PATH (front)"
     Write-Dim "(restart terminal for PATH to take effect)"
 } else {
@@ -1561,8 +1717,10 @@ if (-not $binInPath) {
         $pathParts = @($pathParts | Where-Object { $_ -ine $BinDir })
         $pathParts = , $BinDir + $pathParts
         $newPath = $pathParts -join ";"
+        $script:OriginalUserPath = $userPath
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
         $env:Path = "$BinDir;$env:Path"
+        $script:RollbackPathAdded = $true
         Write-OK "Moved $BinDir before npm in PATH"
         Write-Dim "(restart terminal for PATH to take effect)"
     }

@@ -17,20 +17,29 @@ BIN_DIR="$HOME/.local/bin"
 VERSION="${CLAWGOD_VERSION:-latest}"
 
 # ─── Transactional state ─────────────────────────────────
-# Track what we create/modify so we can roll back on failure.
+# Track what we create/modify so we can clean up on failure or uninstall.
 _ROLLBACK_FILES=""       # new files to remove
-_ROLLBACK_RESTORE=""     # "src dst" pairs — mv src back to dst on rollback
+_ROLLBACK_RESTORE=""     # "src dst" pairs — mv src back to dst on cleanup
 _ROLLBACK_RMDIRS=""      # directories to remove (only if empty)
 _ROLLBACK_TMPDIR=""      # temp dir for staged files (cleaned on success OR rollback)
+_ROLLBACK_PATH_ADDED=""  # "yes" if we added BIN_DIR to shell rc PATH
 
 _rollback_push_file() { _ROLLBACK_FILES="$_ROLLBACK_FILES|$1"; }
 _rollback_push_restore() { _ROLLBACK_RESTORE="$_ROLLBACK_RESTORE|$1|$2"; }
 _rollback_push_rmdir() { _ROLLBACK_RMDIRS="$_ROLLBACK_RMDIRS|$1"; }
 
-_rollback() {
-  local ec=$?
-  [ "$ec" -eq 0 ] && return 0
-  echo -e "  ${RED}Install failed (exit $ec). Rolling back ...${NC}" >&2
+# Unified cleanup. Mode: "rollback" (install failed) or "uninstall" (user requested).
+_do_cleanup() {
+  local mode="${1:-rollback}"
+
+  if [ "$mode" = "rollback" ]; then
+    local ec=$?
+    [ "$ec" -eq 0 ] && return 0
+    echo -e "  ${RED}Install failed (exit $ec). Rolling back ...${NC}" >&2
+  else
+    echo -e "  ${DIM}Uninstalling ...${NC}" >&2
+  fi
+
   # Restore backed-up files
   if [ -n "$_ROLLBACK_RESTORE" ]; then
     IFS='|' read -ra _pairs <<< "$_ROLLBACK_RESTORE"
@@ -45,6 +54,7 @@ _rollback() {
       i=$((i + 1))
     done
   fi
+
   # Remove new files
   if [ -n "$_ROLLBACK_FILES" ]; then
     IFS='|' read -ra _files <<< "$_ROLLBACK_FILES"
@@ -53,6 +63,7 @@ _rollback() {
       [ -f "$_f" ] && rm -f "$_f" 2>/dev/null && echo -e "  ${DIM}Removed $_f${NC}" >&2
     done
   fi
+
   # Remove directories (only if empty — safe)
   if [ -n "$_ROLLBACK_RMDIRS" ]; then
     IFS='|' read -ra _dirs <<< "$_ROLLBACK_RMDIRS"
@@ -61,11 +72,78 @@ _rollback() {
       [ -d "$_d" ] && rmdir "$_d" 2>/dev/null
     done
   fi
-  # Clean temp dir
-  [ -n "$_ROLLBACK_TMPDIR" ] && [ -d "$_ROLLBACK_TMPDIR" ] && rm -rf "$_ROLLBACK_TMPDIR"
-  echo -e "  ${RED}Rollback complete. System restored to pre-install state.${NC}" >&2
+
+  # ── Uninstall-only steps ──
+  if [ "$mode" = "uninstall" ]; then
+    # Remove PATH entry from shell rc
+    if [ "$_ROLLBACK_PATH_ADDED" = "yes" ]; then
+      _rc=""
+      case "$(basename "$SHELL")"
+        in zsh)  _rc="$HOME/.zshrc" ;;
+           bash) _rc="$HOME/.bashrc" ;;
+           fish) _rc="$HOME/.config/fish/config.fish" ;;
+           *)    _rc="$HOME/.profile" ;;
+      esac
+      if [ -f "$_rc" ]; then
+        case "$(basename "$SHELL")" in
+          fish) _path_pattern='set -gx PATH '"$BIN_DIR"' \$PATH' ;;
+          *)    _path_pattern='export PATH="\$HOME/.local/bin:\$PATH"' ;;
+        esac
+        if grep -q "$_path_pattern" "$_rc" 2>/dev/null; then
+          _tmp_rc="${_rc}.clawgod-tmp.$$"
+          grep -v "$_path_pattern" "$_rc" > "$_tmp_rc" && mv "$_tmp_rc" "$_rc"
+          echo -e "  ${DIM}Removed PATH entry from $(basename "$_rc")${NC}" >&2
+        fi
+      fi
+    fi
+
+    # Clean up stale claude launchers in npm's global bin dir
+    if command -v npm &>/dev/null; then
+      _npm_prefix=$(npm config get prefix 2>/dev/null || true)
+      _npm_prefix="${_npm_prefix%/bin}"
+      if [ -n "$_npm_prefix" ] && [ -d "$_npm_prefix/bin" ]; then
+        _npm_bindir="$_npm_prefix/bin"
+        for _name in claude clawgod; do
+          _f="$_npm_bindir/$_name"
+          _orig="$_npm_bindir/$_name.orig"
+          if [ -f "$_f" ] && grep -q "clawgod" "$_f" 2>/dev/null; then
+            if [ -f "$_orig" ]; then
+              mv "$_orig" "$_f" 2>/dev/null
+              echo -e "  ${DIM}Restored original npm launcher ($_f)${NC}" >&2
+            else
+              rm -f "$_f"
+              echo -e "  ${DIM}Removed stale npm launcher ($_f)${NC}" >&2
+            fi
+          fi
+        done
+        for _name in claude clawgod; do
+          _orig="$_npm_bindir/$_name.orig"
+          _main="$_npm_bindir/$_name"
+          if [ -f "$_orig" ] && [ ! -f "$_main" ]; then
+            mv "$_orig" "$_main" 2>/dev/null
+            echo -e "  ${DIM}Restored original npm launcher ($_main)${NC}" >&2
+          fi
+        done
+      fi
+    fi
+
+    # Remove .clawgod entirely (even if non-empty — user asked to uninstall)
+    if [ -d "$CLAWGOD_DIR" ]; then
+      rm -rf "$CLAWGOD_DIR"
+      echo -e "  ${DIM}Removed $CLAWGOD_DIR${NC}" >&2
+    fi
+  fi
+
+  # Clean temp dir (rollback only — gone by uninstall time)
+  if [ "$mode" = "rollback" ]; then
+    [ -n "$_ROLLBACK_TMPDIR" ] && [ -d "$_ROLLBACK_TMPDIR" ] && rm -rf "$_ROLLBACK_TMPDIR"
+  fi
+
+  if [ "$mode" = "rollback" ]; then
+    echo -e "  ${RED}Rollback complete. System restored to pre-install state.${NC}" >&2
+  fi
 }
-trap _rollback EXIT
+trap '_do_cleanup rollback' EXIT
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -95,68 +173,46 @@ echo ""
 # ─── Uninstall ─────────────────────────────────────────
 
 if [ "$UNINSTALL" = "1" ]; then
+  # Populate rollback tracking from current filesystem state,
+  # then delegate to _do_cleanup uninstall.
   CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+
+  # Find .orig backups and clawgod launchers in BinDir and claude's dir
   for DIR in "${CLAUDE_BIN:+$(dirname "$CLAUDE_BIN")}" "$BIN_DIR"; do
     [ -z "$DIR" ] && continue
     if [ -e "$DIR/claude.orig" ]; then
-      # Has backup — restore it
-      mv "$DIR/claude.orig" "$DIR/claude"
-      info "Original claude restored ($DIR/claude)"
-    elif [ -f "$DIR/claude" ] && grep -q "clawgod" "$DIR/claude" 2>/dev/null; then
-      # Our launcher, no backup — remove it (otherwise it points to deleted cli.js)
-      rm -f "$DIR/claude"
-      info "Removed ClawGod launcher ($DIR/claude)"
+      _rollback_push_restore "$DIR/claude.orig" "$DIR/claude"
     fi
-    # Always remove the explicit clawgod alias if it's ours
-    if [ -f "$DIR/clawgod" ] && grep -q "clawgod" "$DIR/clawgod" 2>/dev/null; then
-      rm -f "$DIR/clawgod"
-      info "Removed ClawGod alias ($DIR/clawgod)"
+    if [ -f "$DIR/claude" ] && grep -q "clawgod" "$DIR/claude" 2>/dev/null; then
+      case "|$_ROLLBACK_RESTORE|" in
+        *"|$DIR/claude|"*) ;;
+        *) _rollback_push_file "$DIR/claude" ;;
+      esac
+    fi
+    if [ -f "$DIR/clawgod" ]; then
+      _rollback_push_file "$DIR/clawgod"
     fi
   done
 
-  # Clean up stale claude launchers in npm's global bin dir.
-  # The installer relies on PATH precedence (~/.local/bin before npm) — after
-  # uninstall, our launcher is gone but npm's claude may still reference the
-  # deleted .clawgod/cli.cjs, leaving a broken command.
-  # If npm dir has .orig backups, restore them; otherwise remove clawgod refs.
-  if command -v npm &>/dev/null; then
-    _npm_prefix=$(npm config get prefix 2>/dev/null || true)
-    _npm_prefix="${_npm_prefix%/bin}"
-    if [ -n "$_npm_prefix" ] && [ -d "$_npm_prefix/bin" ]; then
-      _npm_bindir="$_npm_prefix/bin"
-      for _name in claude clawgod; do
-        _f="$_npm_bindir/$_name"
-        _orig="$_npm_bindir/$_name.orig"
-        if [ -f "$_f" ] && grep -q "clawgod" "$_f" 2>/dev/null; then
-          if [ -f "$_orig" ]; then
-            mv "$_orig" "$_f"
-            info "Restored original npm launcher ($_f)"
-          else
-            rm -f "$_f"
-            info "Removed stale npm launcher ($_f)"
-          fi
-        fi
-      done
-      # Clean up leftover .orig files if the main file was already removed
-      for _name in claude clawgod; do
-        _orig="$_npm_bindir/$_name.orig"
-        _main="$_npm_bindir/$_name"
-        if [ -f "$_orig" ] && [ ! -f "$_main" ]; then
-          mv "$_orig" "$_main"
-          info "Restored original npm launcher ($_main)"
-        fi
-      done
-    fi
-  fi
+  # Track .clawgod files for removal
+  for _f in node_modules vendor bun-runtime cli.original.js cli.original.js.bak \
+            cli.original.cjs cli.original.cjs.bak cli.js cli.cjs patch.mjs patch.js \
+            extract-natives.mjs post-process.mjs repatch.mjs .source-version \
+            features.json provider.json; do
+    [ -f "$CLAWGOD_DIR/$_f" ] && _rollback_push_file "$CLAWGOD_DIR/$_f"
+  done
 
-  # No npm file restoration needed — we never replaced them (PATH precedence only)
+  # Track directories we may have created
+  [ -d "$CLAWGOD_DIR" ] && _rollback_push_rmdir "$CLAWGOD_DIR"
+  [ -d "$BIN_DIR" ] && _rollback_push_rmdir "$BIN_DIR"
 
-  rm -rf "$CLAWGOD_DIR/node_modules" "$CLAWGOD_DIR/vendor" "$CLAWGOD_DIR/bun-runtime" "$CLAWGOD_DIR/cli.original.js" "$CLAWGOD_DIR/cli.original.js.bak" "$CLAWGOD_DIR/cli.original.cjs" "$CLAWGOD_DIR/cli.original.cjs.bak" "$CLAWGOD_DIR/cli.js" "$CLAWGOD_DIR/cli.cjs" "$CLAWGOD_DIR/patch.mjs" "$CLAWGOD_DIR/patch.js" "$CLAWGOD_DIR/extract-natives.mjs" "$CLAWGOD_DIR/post-process.mjs" "$CLAWGOD_DIR/repatch.mjs" "$CLAWGOD_DIR/.source-version" "$CLAWGOD_DIR/features.json" "$CLAWGOD_DIR/provider.json" "$CLAWGOD_DIR/install.sh" "$CLAWGOD_DIR/install.ps1"
-  # Remove .clawgod directory itself if empty
-  if [ -d "$CLAWGOD_DIR" ] && [ -z "$(ls -A "$CLAWGOD_DIR" 2>/dev/null)" ]; then
-    rmdir "$CLAWGOD_DIR"
-    info "Removed ~/.clawgod directory"
-  fi
+  # Mark PATH as added so _do_cleanup knows to remove it
+  _ROLLBACK_PATH_ADDED="yes"
+
+  # Disable the EXIT trap (we're calling cleanup explicitly)
+  trap - EXIT
+  _do_cleanup uninstall
+
   hash -r 2>/dev/null
   info "ClawGod uninstalled"
   echo ""
@@ -209,10 +265,11 @@ info "ripgrep: $(rg --version | head -1)"
 # runtime. Source: npm registry (@anthropic-ai/claude-code-<platform>).
 # Local binary detection is intentionally skipped — see policy note below.
 
-mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
 # Track these dirs for rollback (rmdir only removes if empty, so safe)
+# Must check BEFORE mkdir -p, otherwise condition is always false.
 [ ! -d "$CLAWGOD_DIR" ] && _rollback_push_rmdir "$CLAWGOD_DIR"
 [ ! -d "$BIN_DIR" ] && _rollback_push_rmdir "$BIN_DIR"
+mkdir -p "$CLAWGOD_DIR" "$BIN_DIR"
 
 NATIVE_BIN=""
 NATIVE_BIN_LABEL=""
@@ -277,7 +334,7 @@ if [ -z "$NATIVE_BIN" ]; then
         sz=$(stat -f%z "$cand" 2>/dev/null || stat -c%s "$cand" 2>/dev/null || echo 0)
         if [ "$sz" -gt 10000000 ]; then
           NATIVE_BIN="$cand"
-          NATIVE_BIN_LABEL=$(node -e "console.log(require('$NATIVE_BIN_TMPDIR/package/package.json').version)" 2>/dev/null || echo "npm-latest")
+          NATIVE_BIN_LABEL=$(node -e "console.log(require(process.argv[1]).version)" "$NATIVE_BIN_TMPDIR/package/package.json" 2>/dev/null || echo "npm-latest")
         fi
       fi
     fi
@@ -908,6 +965,7 @@ _rollback_push_file "$CLAWGOD_DIR/post-process.mjs"
 node "$CLAWGOD_DIR/post-process.mjs" 2>&1 | while IFS= read -r line; do echo "  $line"; done
 [ -f "$CLAWGOD_DIR/cli.original.cjs" ] || { err "Post-process failed"; exit 1; }
 _rollback_push_file "$CLAWGOD_DIR/cli.original.cjs"
+[ -f "$CLAWGOD_DIR/provider.json" ] && _rollback_push_file "$CLAWGOD_DIR/provider.json"
 
 # Stamp the source version so the wrapper can detect drift on next launch
 echo "$NATIVE_BIN_LABEL" > "$CLAWGOD_DIR/.source-version"
@@ -1469,6 +1527,31 @@ if [ ! -f "$CLAWGOD_DIR/features.json" ]; then
 FEATURES_EOF
   _rollback_push_file "$CLAWGOD_DIR/features.json"
   info "Default features.json created"
+else
+  # Merge new keys into existing features.json on re-install
+  node -e "
+    const fs = require('fs');
+    const f = process.argv[1];
+    const defaults = {
+      tengu_harbor: true,
+      tengu_session_memory: true,
+      tengu_amber_flint: true,
+      tengu_auto_background_agents: true,
+      tengu_destructive_command_warning: true,
+      tengu_immediate_model_command: true,
+      tengu_desktop_upsell: false,
+      tengu_malort_pedway: {enabled: true},
+      tengu_amber_quartz_disabled: false,
+      tengu_prompt_cache_1h_config: {allowlist: ['*']}
+    };
+    const existing = JSON.parse(fs.readFileSync(f, 'utf8'));
+    let modified = false;
+    for (const [k, v] of Object.entries(defaults)) {
+      if (!(k in existing)) { existing[k] = v; modified = true; }
+    }
+    if (modified) { fs.writeFileSync(f, JSON.stringify(existing, null, 2) + '\n'); }
+    process.exit(modified ? 0 : 1);
+  " "$CLAWGOD_DIR/features.json" 2>/dev/null && info "Updated features.json with new keys"
 fi
 
 # ─── Verify extracted Bun loads cli.cjs ──────────────────
@@ -1524,8 +1607,8 @@ if [ -z "$CLAUDE_BIN" ]; then
 fi
 CLAUDE_DIR=$(dirname "$CLAUDE_BIN")
 
-# Back up original claude (only once)
-if [ ! -e "$CLAUDE_BIN.orig" ]; then
+# Back up original claude (only once, and skip if it's already our launcher)
+if [ ! -e "$CLAUDE_BIN.orig" ] && ! grep -q "clawgod" "$CLAUDE_BIN" 2>/dev/null; then
   if [ -L "$CLAUDE_BIN" ]; then
     # Symlink (native install) — preserve target
     NATIVE_BIN="$(readlink "$CLAUDE_BIN")"
@@ -1564,9 +1647,17 @@ write_launcher() {
   dir=$(dirname "$target")
   mkdir -p "$dir"
   rm -f "$target"
-  printf '%s\n' "$LAUNCHER_CONTENT" > "$target"
+  local tmpfile
+  tmpfile="${target}.tmp.$$"
+  printf '%s\n' "$LAUNCHER_CONTENT" > "$tmpfile" && mv -f "$tmpfile" "$target"
   chmod +x "$target"
-  _rollback_push_file "$target"
+  # Only track for removal if no restore entry already covers this path.
+  # Otherwise rollback would: restore .orig → target, then rm target —
+  # destroying the file we just restored.
+  case "|$_ROLLBACK_RESTORE|" in
+    *"|$target|"*) ;;
+    *) _rollback_push_file "$target" ;;
+  esac
 }
 
 write_launcher "$CLAUDE_BIN"
@@ -1621,9 +1712,14 @@ _ensure_path_precedence() {
       if [ -n "$_npm_idx" ] && [ -n "$_bin_idx" ] && [ "$_npm_idx" -lt "$_bin_idx" ]; then
         # npm dir comes first — need to reorder by prepending BIN_DIR
         export PATH="$BIN_DIR:$PATH"
-        # Persist the reorder
-        if ! grep -q "export PATH=\"\$HOME/.local/bin:\$PATH\"" "$_rc" 2>/dev/null; then
-          printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$_rc"
+        # Persist the reorder (only if not already in rc)
+        case "$(basename "$SHELL")" in
+          fish) _path_line="set -gx PATH $BIN_DIR \$PATH" ;;
+          *)    _path_line='export PATH="$HOME/.local/bin:$PATH"' ;;
+        esac
+        if ! grep -qF "$_path_line" "$_rc" 2>/dev/null; then
+          printf '\n%s\n' "$_path_line" >> "$_rc"
+          _ROLLBACK_PATH_ADDED="yes"
         fi
         info "Moved $BIN_DIR before npm in PATH"
       fi
@@ -1639,6 +1735,7 @@ _ensure_path_precedence() {
   esac
   if ! grep -q "$_path_line" "$_rc" 2>/dev/null; then
     printf '\n%s\n' "$_path_line" >> "$_rc"
+    _ROLLBACK_PATH_ADDED="yes"
   fi
   info "Added $BIN_DIR to PATH (front)"
   dim "  Run: source $_rc  (or restart terminal)"
