@@ -60,7 +60,7 @@ _do_cleanup() {
     IFS='|' read -ra _files <<< "$_ROLLBACK_FILES"
     for _f in "${_files[@]}"; do
       [ -z "$_f" ] && continue
-      [ -f "$_f" ] && rm -f "$_f" 2>/dev/null && echo -e "  ${DIM}Removed $_f${NC}" >&2
+      [ -e "$_f" ] && rm -rf "$_f" 2>/dev/null && echo -e "  ${DIM}Removed $_f${NC}" >&2
     done
   fi
 
@@ -69,7 +69,7 @@ _do_cleanup() {
     IFS='|' read -ra _dirs <<< "$_ROLLBACK_RMDIRS"
     for _d in "${_dirs[@]}"; do
       [ -z "$_d" ] && continue
-      [ -d "$_d" ] && rmdir "$_d" 2>/dev/null
+      [ -d "$_d" ] && { rmdir "$_d" 2>/dev/null || true; }
     done
   fi
 
@@ -175,10 +175,38 @@ echo ""
 if [ "$UNINSTALL" = "1" ]; then
   # Populate rollback tracking from current filesystem state,
   # then delegate to _do_cleanup uninstall.
-  CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
 
-  # Find .orig backups and clawgod launchers in BinDir and claude's dir
-  for DIR in "${CLAUDE_BIN:+$(dirname "$CLAUDE_BIN")}" "$BIN_DIR"; do
+  # Read saved launcher paths (written during install) so we can clean up
+  # even when PATH resolution has changed (e.g. WSL where claude resolves
+  # to Windows npm dir during install but ~/.local/bin after PATH prepend).
+  _saved_launchers=""
+  if [ -f "$CLAWGOD_DIR/.launcher-paths" ]; then
+    _saved_launchers=$(cat "$CLAWGOD_DIR/.launcher-paths" 2>/dev/null)
+  fi
+
+  CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+  # Skip Windows mount paths in WSL — those belong to install.ps1
+  if [ -n "$CLAUDE_BIN" ]; then
+    case "$CLAUDE_BIN" in /mnt/*) CLAUDE_BIN="" ;; esac
+  fi
+  _scan_dirs=""
+  for _dir in "${CLAUDE_BIN:+$(dirname "$CLAUDE_BIN")}" "$BIN_DIR"; do
+    [ -z "$_dir" ] && continue
+    case "|$_scan_dirs|" in *"|$_dir|"*) ;; *) _scan_dirs="${_scan_dirs:+$_scan_dirs|}$_dir" ;; esac
+  done
+  # Also add dirs from saved launcher paths
+  if [ -n "$_saved_launchers" ]; then
+    IFS='|' read -ra _paths <<< "$_saved_launchers"
+    for _p in "${_paths[@]}"; do
+      [ -z "$_p" ] && continue
+      _dir=$(dirname "$_p")
+      case "|$_scan_dirs|" in *"|$_dir|"*) ;; *) _scan_dirs="${_scan_dirs:+$_scan_dirs|}$_dir" ;; esac
+    done
+  fi
+
+  # Find .orig backups and clawgod launchers in all scanned dirs
+  IFS='|' read -ra _dirs <<< "$_scan_dirs"
+  for DIR in "${_dirs[@]}"; do
     [ -z "$DIR" ] && continue
     if [ -e "$DIR/claude.orig" ]; then
       _rollback_push_restore "$DIR/claude.orig" "$DIR/claude"
@@ -194,12 +222,17 @@ if [ "$UNINSTALL" = "1" ]; then
     fi
   done
 
-  # Track .clawgod files for removal
+  # Track .clawgod files and subdirs for removal
   for _f in node_modules vendor bun-runtime cli.original.js cli.original.js.bak \
             cli.original.cjs cli.original.cjs.bak cli.js cli.cjs patch.mjs patch.js \
             extract-natives.mjs post-process.mjs repatch.mjs .source-version \
-            features.json provider.json; do
-    [ -f "$CLAWGOD_DIR/$_f" ] && _rollback_push_file "$CLAWGOD_DIR/$_f"
+            features.json provider.json .launcher-paths; do
+    _p="$CLAWGOD_DIR/$_f"
+    if [ -d "$_p" ]; then
+      _rollback_push_file "$_p"   # _do_cleanup uses rm -f which works on dirs too
+    elif [ -f "$_p" ]; then
+      _rollback_push_file "$_p"
+    fi
   done
 
   # Track directories we may have created
@@ -1599,7 +1632,15 @@ exec \"\$BUN_BIN\" \"\$CLAWGOD_CLI\" \"\$@\""
 # `command -v` is a POSIX builtin (works even on minimal images that no
 # longer ship `which`); `|| true` keeps a clean miss from tripping
 # `set -e` via the assignment's exit status under bash 5+.
+#
+# WSL caveat: Windows paths (/mnt/c/...) may appear in PATH, so
+# command -v claude can resolve to the Windows npm dir. We must NOT
+# write launchers there — install.sh is Linux/macOS only; Windows
+# launchers belong to install.ps1. Skip any path under /mnt/.
 CLAUDE_BIN=$(command -v claude 2>/dev/null || true)
+if [ -n "$CLAUDE_BIN" ]; then
+  case "$CLAUDE_BIN" in /mnt/*) CLAUDE_BIN="" ;; esac
+fi
 if [ -z "$CLAUDE_BIN" ]; then
   # No claude in PATH — use default location
   CLAUDE_BIN="$BIN_DIR/claude"
@@ -1676,6 +1717,15 @@ fi
 #  - User restored claude.orig via uninstall but still wants the patched one
 write_launcher "$BIN_DIR/clawgod"
 info "Command 'clawgod' → patched ($BIN_DIR/clawgod)"
+
+# Record all launcher paths so uninstall can find them even if PATH resolution
+# changes (e.g. WSL where claude resolves to Windows npm dir during install
+# but to ~/.local/bin after our PATH prepend).
+_launcher_paths="$CLAUDE_BIN"
+[ "$CLAUDE_DIR" != "$BIN_DIR" ] && _launcher_paths="$_launcher_paths|$BIN_DIR/claude"
+_launcher_paths="$_launcher_paths|$BIN_DIR/clawgod"
+echo "$_launcher_paths" > "$CLAWGOD_DIR/.launcher-paths"
+_rollback_push_file "$CLAWGOD_DIR/.launcher-paths"
 
 
 # ─── Ensure ~/.local/bin is in PATH and before npm's global bin ────────
