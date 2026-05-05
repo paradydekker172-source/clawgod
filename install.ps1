@@ -748,6 +748,9 @@ function identifyDylib(buf, dylib) {
   const body = buf.slice(dylib.offset, dylib.offset + dylib.size);
   for (const m of KNOWN_MODULES) {
     if (body.indexOf(Buffer.from(m)) !== -1) return m;
+    // PE DLLs use underscores instead of hyphens (e.g. image_processor)
+    const underscored = m.replace(/-/g, '_');
+    if (underscored !== m && body.indexOf(Buffer.from(underscored)) !== -1) return m;
   }
 
   return null;
@@ -995,7 +998,14 @@ Write-Dim "Extracting native modules from $NativeBinLabel ..."
 # Bun is the exact build that Anthropic used to compile the embedded bundle.
 
 $BunRuntimeDir = Join-Path $ClawDir "bun-runtime"
-if (Test-Path $BunRuntimeDir) { Remove-Item -Recurse -Force $BunRuntimeDir }
+if (Test-Path $BunRuntimeDir) {
+    # Kill any process holding bun.exe open (proxy, background worker, etc.)
+    $bunExe = Join-Path $BunRuntimeDir "bun.exe"
+    if (Test-Path $bunExe) {
+        Get-Process | Where-Object { $_.Path -eq $bunExe } | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Recurse -Force $BunRuntimeDir -ErrorAction Stop
+}
 New-Item -ItemType Directory -Force -Path $BunRuntimeDir | Out-Null
 Push-RollbackRmdir $BunRuntimeDir
 
