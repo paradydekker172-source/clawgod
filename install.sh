@@ -982,8 +982,9 @@ code = code.replace(
 );
 
 // (2) build-time fileURLToPath() leaks → use cli.cjs's own __filename
+//     Matches both Linux (/home/runner/...) and Windows (D:/a/...) build paths
 code = code.replace(
-  /[\w$]+\.fileURLToPath\("file:\/\/\/home\/runner\/work\/claude-cli-internal\/claude-cli-internal\/[^"]*"\)/g,
+  /[\w$]+\.fileURLToPath\("file:\/\/\/(?:home\/runner\/work|D:\/a)\/claude-cli-internal\/claude-cli-internal\/[^"]*"\)/g,
   () => '__filename',
 );
 
@@ -1138,9 +1139,6 @@ if (config.timeoutMs) {
 }
 process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ??= '1';
 process.env.DISABLE_INSTALLATION_CHECKS ??= '1';
-// Use system ripgrep (extracted vendor rg path was build-time-baked; system
-// rg is the most reliable fallback under Bun runtime).
-process.env.USE_BUILTIN_RIPGREP ??= '1';
 
 const featuresFile = join(providerDir, 'features.json');
 if (!process.env.CLAUDE_INTERNAL_FC_OVERRIDES && existsSync(featuresFile)) {
